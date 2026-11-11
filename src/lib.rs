@@ -10,6 +10,8 @@ pub mod repo;
 pub mod sbs;
 pub mod stage;
 pub mod status;
+pub mod ui;
+pub mod ui_bridge;
 pub mod watch;
 
 pub use error::{CoreError, Result};

@@ -1,0 +1,115 @@
+// Overlay pieces: the repo menu popup content and the error banner.
+import { Theme, FlatButton } from "theme.slint";
+
+component MenuItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> emphasized: false;
+    callback clicked();
+    height: 28px;
+    border-radius: 4px;
+    background: touch.has-hover ? Theme.row-selected : transparent;
+
+    Text {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: root.text;
+        color: touch.has-hover ? Theme.row-selected-text : Theme.text;
+        font-size: Theme.font-size;
+        font-weight: root.emphasized ? 600 : 400;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Body of the repo dropdown: recent repos then "Open repository...".
+export component RepoMenu inherits Rectangle {
+    in property <[string]> recent;
+    callback open-recent(string);
+    callback open-repo-dialog();
+
+    background: Theme.popup-bg;
+    border-color: Theme.border;
+    border-width: 1px;
+    border-radius: 6px;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: #00000060;
+
+    VerticalLayout {
+        padding: 4px;
+        spacing: 0px;
+
+        if root.recent.length > 0: Text {
+            height: 22px;
+            x: 10px;
+            text: "RECENT";
+            color: Theme.text-muted;
+            font-size: Theme.small-font-size;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+
+        for path in root.recent: MenuItem {
+            text: path;
+            clicked => {
+                root.open-recent(path);
+            }
+        }
+
+        if root.recent.length > 0: Rectangle {
+            height: 9px;
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        MenuItem {
+            text: "Open repository...";
+            emphasized: true;
+            clicked => {
+                root.open-repo-dialog();
+            }
+        }
+    }
+}
+
+// Banner shown at the top of the diff pane while `text` is not empty.
+export component ErrorBanner inherits Rectangle {
+    in property <string> text;
+    callback dismiss();
+
+    background: Theme.error-bg;
+    min-height: 36px;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 10px;
+
+        Text {
+            text: root.text;
+            color: Theme.error-text;
+            font-size: Theme.font-size;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+
+        FlatButton {
+            text: "Dismiss";
+            vertical-stretch: 0;
+            clicked => {
+                root.dismiss();
+            }
+        }
+    }
+}

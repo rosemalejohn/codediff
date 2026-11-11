@@ -1,0 +1,102 @@
+// Left sidebar of the Changes tab: Staged and Unstaged groups of files.
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export struct FileRow {
+    path: string,
+    letter: string,
+    side: int, // 0 staged, 1 unstaged
+    selected: bool,
+}
+
+component GroupHeader inherits Rectangle {
+    in property <string> title;
+    in property <int> count;
+    height: 26px;
+
+    Text {
+        x: 10px;
+        y: parent.height - self.height - 4px;
+        text: root.title + " (" + root.count + ")";
+        color: Theme.text-muted;
+        font-size: Theme.small-font-size;
+        font-weight: 600;
+        letter-spacing: 0.06px * 11;
+    }
+}
+
+component FileRowView inherits Rectangle {
+    in property <FileRow> file;
+    callback clicked();
+    height: Theme.row-height;
+    background: file.selected ? Theme.row-selected : (touch.has-hover ? Theme.row-hover : transparent);
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 8px;
+
+        Text {
+            width: 12px;
+            text: file.letter;
+            color: Theme.letter-color(file.letter);
+            font-weight: 700;
+            font-family: Theme.mono-font;
+            font-size: Theme.mono-font-size;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: file.path;
+            color: file.selected ? Theme.row-selected-text : Theme.text;
+            font-size: Theme.font-size;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+export component ChangesSidebar inherits Rectangle {
+    in property <[FileRow]> staged;
+    in property <[FileRow]> unstaged;
+    callback select-change(int, string);
+
+    background: Theme.window-bg;
+
+    ScrollView {
+        VerticalLayout {
+            alignment: start;
+            padding-bottom: 8px;
+
+            GroupHeader {
+                title: "STAGED";
+                count: root.staged.length;
+            }
+
+            for row in root.staged: FileRowView {
+                file: row;
+                clicked => {
+                    root.select-change(row.side, row.path);
+                }
+            }
+
+            GroupHeader {
+                title: "UNSTAGED";
+                count: root.unstaged.length;
+            }
+
+            for row in root.unstaged: FileRowView {
+                file: row;
+                clicked => {
+                    root.select-change(row.side, row.path);
+                }
+            }
+        }
+    }
+}

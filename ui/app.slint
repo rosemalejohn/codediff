@@ -1,11 +1,329 @@
-export component AppWindow inherits Window {
-    title: "CodeDiff";
-    preferred-width: 1200px;
-    preferred-height: 800px;
+// CodeDiff main window: top bar, tabs, sidebar and diff pane.
+import { ScrollView } from "std-widgets.slint";
+import { Theme, FlatButton } from "theme.slint";
+import { FileRow, ChangesSidebar } from "sidebar.slint";
+import { RepoMenu, ErrorBanner } from "dialogs.slint";
 
-    Text {
-        text: "CodeDiff";
+export { FileRow }
+
+component TabButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+
+    height: 26px;
+    width: label.preferred-width + 20px;
+    border-radius: 5px;
+    background: active ? Theme.tab-on-bg : (touch.has-hover ? Theme.row-hover : transparent);
+
+    label := Text {
+        text: root.text;
+        color: root.active ? Theme.text-strong : Theme.tab-off-text;
+        font-size: Theme.font-size;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component Welcome inherits Rectangle {
+    in property <[string]> recent;
+    callback open-recent(string);
+    callback open-repo-dialog();
+
+    background: Theme.window-bg;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 14px;
+
+        Text {
+            text: "CodeDiff";
+            color: Theme.text-strong;
+            font-size: 22px;
+            font-weight: 600;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "Open a Git repository to review its changes.";
+            color: Theme.text-muted;
+            font-size: Theme.font-size;
+            horizontal-alignment: center;
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            FlatButton {
+                text: "Open repository...";
+                primary: true;
+                clicked => {
+                    root.open-repo-dialog();
+                }
+            }
+        }
+
+        if root.recent.length > 0: VerticalLayout {
+            spacing: 2px;
+            padding-top: 10px;
+
+            Text {
+                text: "RECENT";
+                color: Theme.text-muted;
+                font-size: Theme.small-font-size;
+                font-weight: 600;
+                horizontal-alignment: center;
+            }
+
+            for path in root.recent: HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 460px;
+                    height: Theme.row-height;
+                    border-radius: 4px;
+                    background: recent-touch.has-hover ? Theme.row-hover : transparent;
+
+                    Text {
+                        width: parent.width - 16px;
+                        text: path;
+                        color: Theme.text;
+                        font-size: Theme.font-size;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    recent-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.open-recent(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: repo-name == "" ? "CodeDiff" : repo-name + " - CodeDiff";
+    preferred-width: 1200px;
+    preferred-height: 800px;
+    min-width: 640px;
+    min-height: 400px;
+    background: Theme.window-bg;
+    default-font-size: Theme.font-size;
+
+    in-out property <string> repo-name;
+    in-out property <[string]> recent;
+    in-out property <int> active-tab: 0; // 0 Changes, 1 History
+    in-out property <[FileRow]> staged;
+    in-out property <[FileRow]> unstaged;
+    in-out property <int> change-count;
+    in-out property <bool> has-repo: false;
+    in-out property <string> error-text;
+    in-out property <bool> dark <=> Theme.dark;
+    // Current Changes selection; side -1 means nothing selected.
+    in-out property <int> selected-side: -1;
+    in-out property <string> selected-path;
+    in-out property <length> sidebar-width: 260px;
+
+    callback open-repo-dialog();
+    callback open-recent(string);
+    callback select-change(int, string);
+    callback dismiss-error();
+    callback dark-changed(bool);
+
+    changed dark => {
+        root.dark-changed(root.dark);
+    }
+
+    VerticalLayout {
+        // Top bar
+        Rectangle {
+            height: Theme.bar-height;
+            background: Theme.bar-bg;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 12px;
+                alignment: start;
+
+                repo-button := Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    height: 26px;
+                    width: repo-label.preferred-width + 24px;
+                    border-radius: 5px;
+                    background: repo-touch.has-hover ? Theme.row-hover : transparent;
+
+                    repo-label := Text {
+                        x: 8px;
+                        text: (root.has-repo ? root.repo-name : "No repository") + "  \u{25BE}";
+                        color: Theme.text-strong;
+                        font-size: Theme.font-size;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+
+                    repo-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            repo-popup.show();
+                        }
+                    }
+
+                    repo-popup := PopupWindow {
+                        x: 0px;
+                        y: parent.height + 4px;
+                        width: 360px;
+
+                        RepoMenu {
+                            recent: root.recent;
+                            open-recent(path) => {
+                                repo-popup.close();
+                                root.open-recent(path);
+                            }
+                            open-repo-dialog => {
+                                repo-popup.close();
+                                root.open-repo-dialog();
+                            }
+                        }
+                    }
+                }
+
+                if root.has-repo: HorizontalLayout {
+                    spacing: 4px;
+                    padding-top: 7px;
+                    padding-bottom: 7px;
+
+                    TabButton {
+                        text: "Changes " + root.change-count;
+                        active: root.active-tab == 0;
+                        clicked => {
+                            root.active-tab = 0;
+                        }
+                    }
+
+                    TabButton {
+                        text: "History";
+                        active: root.active-tab == 1;
+                        clicked => {
+                            root.active-tab = 1;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        if !root.has-repo: Welcome {
+            recent: root.recent;
+            open-recent(path) => {
+                root.open-recent(path);
+            }
+            open-repo-dialog => {
+                root.open-repo-dialog();
+            }
+        }
+
+        if root.has-repo: HorizontalLayout {
+            // Sidebar
+            Rectangle {
+                width: root.sidebar-width;
+
+                if root.active-tab == 0: ChangesSidebar {
+                    staged: root.staged;
+                    unstaged: root.unstaged;
+                    select-change(side, path) => {
+                        root.select-change(side, path);
+                    }
+                }
+
+                if root.active-tab == 1: Rectangle {
+                    background: Theme.window-bg;
+                }
+            }
+
+            // Drag handle: border line plus a wider hit area.
+            Rectangle {
+                width: 1px;
+                background: handle.has-hover || handle.pressed ? Theme.accent : Theme.border;
+
+                handle := TouchArea {
+                    x: -3px;
+                    width: 7px;
+                    mouse-cursor: col-resize;
+                    moved => {
+                        if self.pressed {
+                            root.sidebar-width = clamp(
+                                root.sidebar-width + (self.mouse-x - self.pressed-x),
+                                180px,
+                                max(180px, root.width - 320px));
+                        }
+                    }
+                }
+            }
+
+            // Diff pane
+            VerticalLayout {
+                horizontal-stretch: 1;
+
+                if root.error-text != "": ErrorBanner {
+                    text: root.error-text;
+                    dismiss => {
+                        root.dismiss-error();
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: Theme.window-bg;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 6px;
+
+                        Text {
+                            text: root.active-tab == 0 && root.change-count == 0 ? "No changes"
+                                : root.active-tab == 0 && root.selected-path != "" ? root.selected-path
+                                : root.active-tab == 0 ? "Select a file to see its diff"
+                                : "Select a commit";
+                            color: root.active-tab == 0 && root.selected-path != "" && root.change-count > 0
+                                ? Theme.text : Theme.text-muted;
+                            font-size: root.active-tab == 0 && root.change-count == 0 ? 16px : Theme.font-size;
+                            horizontal-alignment: center;
+                        }
+
+                        if root.active-tab == 0 && root.change-count == 0: Text {
+                            text: "The working tree is clean.";
+                            color: Theme.text-muted;
+                            font-size: Theme.small-font-size;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Error banner also visible on the welcome screen (e.g. not a Git repo).
+    if !root.has-repo && root.error-text != "": ErrorBanner {
+        y: Theme.bar-height;
+        width: root.width;
+        text: root.error-text;
+        dismiss => {
+            root.dismiss-error();
+        }
     }
 }

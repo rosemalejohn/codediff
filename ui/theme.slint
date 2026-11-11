@@ -1,0 +1,82 @@
+// Color palette and metrics shared by every view. Dark is the primary target.
+import { Palette } from "std-widgets.slint";
+
+export global Theme {
+    in-out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+
+    out property <brush> window-bg: dark ? #1e1f22 : #ffffff;
+    out property <brush> bar-bg: dark ? #2b2d31 : #f3f3f4;
+    out property <brush> border: dark ? #333438 : #dcdde0;
+    out property <brush> text: dark ? #cfd2d6 : #1f2328;
+    out property <brush> text-strong: dark ? #ffffff : #000000;
+    out property <brush> text-muted: dark ? #80868b : #6e7781;
+    out property <brush> tab-on-bg: dark ? #3a3d43 : #e1e3e6;
+    out property <brush> tab-off-text: dark ? #9aa0a6 : #57606a;
+    out property <brush> row-hover: dark ? #26282c : #eef0f2;
+    out property <brush> row-selected: dark ? #2f4a6b : #cfe2ff;
+    out property <brush> row-selected-text: dark ? #ffffff : #0b1d33;
+    out property <brush> button-bg: dark ? #3a3d43 : #e7e8ea;
+    out property <brush> button-hover: dark ? #474a51 : #d9dbde;
+    out property <brush> button-text: dark ? #dddddd : #1f2328;
+    out property <brush> accent: dark ? #3874cb : #0969da;
+    out property <brush> accent-text: #ffffff;
+    out property <brush> popup-bg: dark ? #2b2d31 : #ffffff;
+    out property <brush> error-bg: dark ? #5a2a2e : #ffebe9;
+    out property <brush> error-text: dark ? #ffd7d5 : #82071e;
+
+    out property <brush> letter-added: dark ? #5fb760 : #1a7f37;
+    out property <brush> letter-modified: dark ? #e2b340 : #9a6700;
+    out property <brush> letter-deleted: dark ? #e06c6c : #cf222e;
+    out property <brush> letter-renamed: dark ? #8ab4f8 : #0969da;
+
+    out property <length> font-size: 13px;
+    out property <length> small-font-size: 11px;
+    out property <length> row-height: 24px;
+    out property <length> bar-height: 40px;
+    out property <length> mono-font-size: 12px;
+    out property <string> mono-font: "Menlo";
+
+    public pure function letter-color(letter: string) -> brush {
+        if letter == "A" {
+            return letter-added;
+        }
+        if letter == "M" {
+            return letter-modified;
+        }
+        if letter == "D" {
+            return letter-deleted;
+        }
+        if letter == "R" {
+            return letter-renamed;
+        }
+        return text-muted;
+    }
+}
+
+// Small flat button in the theme's style.
+export component FlatButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    callback clicked();
+
+    height: 26px;
+    min-width: label.preferred-width + 20px;
+    border-radius: 5px;
+    background: primary ? (touch.has-hover ? Theme.accent.darker(10%) : Theme.accent)
+        : (touch.has-hover ? Theme.button-hover : Theme.button-bg);
+
+    label := Text {
+        text: root.text;
+        color: root.primary ? Theme.accent-text : Theme.button-text;
+        font-size: Theme.font-size;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
