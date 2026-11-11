@@ -3,8 +3,7 @@ use crate::model::{FileEntry, FileStatus, StatusLists};
 use crate::Result;
 use git2::{Delta, Repository, StatusOptions};
 
-fn entry(delta: Option<git2::DiffDelta<'_>>) -> Option<FileEntry> {
-    let d = delta?;
+pub(crate) fn entry_from_delta(d: git2::DiffDelta<'_>) -> Option<FileEntry> {
     let new = d.new_file().path()?.to_string_lossy().into_owned();
     let (status, old_path) = match d.status() {
         Delta::Added => (FileStatus::Added, None),
@@ -20,6 +19,10 @@ fn entry(delta: Option<git2::DiffDelta<'_>>) -> Option<FileEntry> {
         _ => return None,
     };
     Some(FileEntry { path: new, old_path, status })
+}
+
+fn entry(delta: Option<git2::DiffDelta<'_>>) -> Option<FileEntry> {
+    entry_from_delta(delta?)
 }
 
 pub fn list_status(repo: &Repository) -> Result<StatusLists> {

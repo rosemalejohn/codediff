@@ -38,3 +38,54 @@ pub enum ChangeSide {
     Staged,
     Unstaged,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffTarget {
+    Unstaged,
+    Staged,
+    Commit(git2::Oid),
+    /// Tree of `base` versus tree of `head`; `base` own changes are excluded.
+    Range { base: git2::Oid, head: git2::Oid },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: LineKind,
+    pub old_no: Option<u32>,
+    pub new_no: Option<u32>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub header: String,
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffBody {
+    Text(Vec<Hunk>),
+    Binary { old_size: u64, new_size: u64 },
+    TooLarge { lines: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub status: FileStatus,
+    pub body: DiffBody,
+    pub additions: u32,
+    pub deletions: u32,
+}

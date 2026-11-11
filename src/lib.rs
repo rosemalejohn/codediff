@@ -1,4 +1,5 @@
 //! CodeDiff library crate.
+pub mod diff;
 pub mod error;
 pub mod model;
 pub mod recent;
