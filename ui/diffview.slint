@@ -1,0 +1,384 @@
+// Right pane of the window: file header, column titles and the side-by-side rows.
+import { ListView } from "std-widgets.slint";
+import { Theme, FlatButton } from "theme.slint";
+
+export struct SegData {
+    text: string,
+    color: color, // transparent means "use the theme text color"
+    changed: bool,
+}
+
+export struct CellData {
+    present: bool,
+    no: int,
+    kind: int, // 0 context, 1 added, 2 removed
+    segs: [SegData],
+}
+
+export struct RowData {
+    is-header: bool,
+    hunk-index: int,
+    header: string,
+    // Lowercase hex of the hunk content fingerprint (header rows only).
+    fingerprint: string,
+    left: CellData,
+    right: CellData,
+}
+
+// Diagonal stripes for the side of a row that has no line.
+component Stripes inherits Rectangle {
+    clip: true;
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: @image-url("stripe.svg");
+        colorize: Theme.stripe;
+        horizontal-tiling: repeat;
+        vertical-tiling: repeat;
+    }
+}
+
+component DiffCell inherits Rectangle {
+    in property <CellData> cell;
+    property <length> gutter: 44px;
+    property <length> text-x: self.gutter + 8px;
+
+    clip: true;
+    background: !cell.present ? transparent
+        : cell.kind == 1 ? Theme.add-bg
+        : cell.kind == 2 ? Theme.del-bg
+        : transparent;
+
+    if !root.cell.present: Stripes {
+        width: root.width;
+        height: root.height;
+    }
+
+    if root.cell.present: Text {
+        x: 0px;
+        width: root.gutter;
+        height: root.height;
+        text: root.cell.no;
+        color: Theme.gutter-text;
+        font-family: Theme.mono-font;
+        font-size: Theme.mono-font-size;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    // Segments laid out at their natural width; long lines are clipped.
+    if root.cell.present: HorizontalLayout {
+        x: root.text-x;
+        width: max(self.preferred-width, root.width - root.text-x);
+        height: root.height;
+        alignment: start;
+        spacing: 0px;
+
+        for seg in root.cell.segs: Rectangle {
+            background: !seg.changed ? transparent
+                : root.cell.kind == 1 ? Theme.add-word
+                : root.cell.kind == 2 ? Theme.del-word
+                : transparent;
+
+            Text {
+                text: seg.text;
+                color: seg.color == Colors.transparent ? Theme.text : seg.color;
+                font-family: Theme.mono-font;
+                font-size: Theme.mono-font-size;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+component HunkHeaderView inherits Rectangle {
+    in property <RowData> data;
+    in property <int> side;
+    in property <bool> actions;
+    callback stage-hunk(int, string, string);
+    callback unstage-hunk(int, string, string);
+    callback request-discard-hunk(int, string, string);
+
+    background: Theme.hunk-bg;
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 6px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 6px;
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.data.header;
+            color: Theme.hunk-text;
+            font-family: Theme.mono-font;
+            font-size: Theme.mono-font-size;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        if root.actions && root.side == 1: FlatButton {
+            small: true;
+            text: "Stage hunk";
+            clicked => {
+                root.stage-hunk(root.data.hunk-index, root.data.header, root.data.fingerprint);
+            }
+        }
+
+        if root.actions && root.side == 1: FlatButton {
+            small: true;
+            danger: true;
+            text: "Discard hunk";
+            clicked => {
+                root.request-discard-hunk(root.data.hunk-index, root.data.header, root.data.fingerprint);
+            }
+        }
+
+        if root.actions && root.side == 0: FlatButton {
+            small: true;
+            text: "Unstage hunk";
+            clicked => {
+                root.unstage-hunk(root.data.hunk-index, root.data.header, root.data.fingerprint);
+            }
+        }
+    }
+}
+
+component DiffRowView inherits Rectangle {
+    in property <RowData> data;
+    in property <int> side;
+    in property <bool> actions;
+    callback stage-hunk(int, string, string);
+    callback unstage-hunk(int, string, string);
+    callback request-discard-hunk(int, string, string);
+    property <length> half: (self.width - 1px) / 2;
+
+    height: data.is-header ? Theme.diff-header-height : Theme.diff-line-height;
+
+    if root.data.is-header: HunkHeaderView {
+        width: root.width;
+        height: root.height;
+        data: root.data;
+        side: root.side;
+        actions: root.actions;
+        stage-hunk(i, h, f) => {
+            root.stage-hunk(i, h, f);
+        }
+        unstage-hunk(i, h, f) => {
+            root.unstage-hunk(i, h, f);
+        }
+        request-discard-hunk(i, h, f) => {
+            root.request-discard-hunk(i, h, f);
+        }
+    }
+
+    if !root.data.is-header: DiffCell {
+        x: 0px;
+        width: root.half;
+        height: root.height;
+        cell: root.data.left;
+    }
+
+    if !root.data.is-header: Rectangle {
+        x: root.half;
+        width: 1px;
+        height: root.height;
+        background: Theme.border;
+    }
+
+    if !root.data.is-header: DiffCell {
+        x: root.half + 1px;
+        width: root.half;
+        height: root.height;
+        cell: root.data.right;
+    }
+}
+
+export component DiffPane inherits Rectangle {
+    in property <string> path;
+    in property <int> side; // -1 none/history, 0 staged, 1 unstaged
+    in property <[RowData]> rows;
+    in property <int> mode; // 0 text, 1 binary, 2 too large, 3 empty
+    in property <string> note;
+    in property <string> left-title;
+    in property <string> right-title;
+    in property <int> additions;
+    in property <int> deletions;
+    in property <bool> hunk-actions;
+    in-out property <length> scroll-y;
+    in-out property <length> visible-height;
+
+    callback stage-file();
+    callback unstage-file();
+    callback request-discard-file();
+    callback stage-hunk(int, string, string);
+    callback unstage-hunk(int, string, string);
+    callback request-discard-hunk(int, string, string);
+    callback load-full-diff();
+
+    background: Theme.window-bg;
+
+    VerticalLayout {
+        // File header: path, counts and file actions.
+        Rectangle {
+            height: 36px;
+            background: Theme.bar-bg;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 8px;
+                padding-top: 5px;
+                padding-bottom: 5px;
+                spacing: 8px;
+
+                Text {
+                    text: root.path;
+                    color: Theme.text-strong;
+                    font-size: Theme.font-size;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                if root.mode == 0: Text {
+                    text: "+" + root.additions;
+                    color: Theme.letter-added;
+                    font-family: Theme.mono-font;
+                    font-size: Theme.mono-font-size;
+                    vertical-alignment: center;
+                }
+
+                if root.mode == 0: Text {
+                    text: "-" + root.deletions;
+                    color: Theme.letter-deleted;
+                    font-family: Theme.mono-font;
+                    font-size: Theme.mono-font-size;
+                    vertical-alignment: center;
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                if root.side == 1: FlatButton {
+                    text: "Stage file";
+                    clicked => {
+                        root.stage-file();
+                    }
+                }
+
+                if root.side == 1: FlatButton {
+                    text: "Discard file";
+                    danger: true;
+                    clicked => {
+                        root.request-discard-file();
+                    }
+                }
+
+                if root.side == 0: FlatButton {
+                    text: "Unstage file";
+                    clicked => {
+                        root.unstage-file();
+                    }
+                }
+            }
+
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        // Column titles.
+        if root.left-title != "" || root.right-title != "": Rectangle {
+            height: 22px;
+
+            Text {
+                x: 10px;
+                width: (parent.width - 1px) / 2 - 20px;
+                height: parent.height;
+                text: root.left-title;
+                color: Theme.text-muted;
+                font-size: Theme.small-font-size;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            Rectangle {
+                x: (parent.width - 1px) / 2;
+                width: 1px;
+                background: Theme.border;
+            }
+
+            Text {
+                x: (parent.width - 1px) / 2 + 11px;
+                width: (parent.width - 1px) / 2 - 20px;
+                height: parent.height;
+                text: root.right-title;
+                color: Theme.text-muted;
+                font-size: Theme.small-font-size;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        if root.mode == 0 && root.rows.length > 0: ListView {
+            vertical-stretch: 1;
+            content-y <=> root.scroll-y;
+            changed visible-height => {
+                root.visible-height = self.visible-height;
+            }
+            init => {
+                root.visible-height = self.visible-height;
+            }
+
+            for row in root.rows: DiffRowView {
+                data: row;
+                side: root.side;
+                actions: root.hunk-actions;
+                stage-hunk(i, h, f) => {
+                    root.stage-hunk(i, h, f);
+                }
+                unstage-hunk(i, h, f) => {
+                    root.unstage-hunk(i, h, f);
+                }
+                request-discard-hunk(i, h, f) => {
+                    root.request-discard-hunk(i, h, f);
+                }
+            }
+        }
+
+        if root.mode != 0 || root.rows.length == 0: Rectangle {
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                alignment: center;
+
+                if root.mode == 2: HorizontalLayout {
+                    alignment: center;
+                    FlatButton {
+                        text: root.note;
+                        clicked => {
+                            root.load-full-diff();
+                        }
+                    }
+                }
+
+                if root.mode != 2: Text {
+                    text: root.note;
+                    color: Theme.text-muted;
+                    font-size: Theme.font-size;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}

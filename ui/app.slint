@@ -2,9 +2,10 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme, FlatButton } from "theme.slint";
 import { FileRow, ChangesSidebar } from "sidebar.slint";
-import { RepoMenu, ErrorBanner } from "dialogs.slint";
+import { RepoMenu, ErrorBanner, ConfirmDialog } from "dialogs.slint";
+import { SegData, CellData, RowData, DiffPane } from "diffview.slint";
 
-export { FileRow }
+export { FileRow, SegData, CellData, RowData }
 
 component TabButton inherits Rectangle {
     in property <string> text;
@@ -133,14 +134,93 @@ export component AppWindow inherits Window {
     in-out property <string> selected-path;
     in-out property <length> sidebar-width: 260px;
 
+    // Diff pane. Side -1 none/history, 0 staged, 1 unstaged.
+    // Mode 0 text, 1 binary, 2 too large, 3 empty (nothing shown).
+    in-out property <string> diff-path;
+    in-out property <int> diff-side: -1;
+    in-out property <[RowData]> diff-rows;
+    in-out property <int> diff-mode: 3;
+    in-out property <string> diff-note;
+    in-out property <string> left-title;
+    in-out property <string> right-title;
+    in-out property <int> diff-additions;
+    in-out property <int> diff-deletions;
+    in-out property <bool> diff-untracked;
+    // False for History and for staged renames (file-level actions only).
+    in-out property <bool> hunk-actions;
+    in-out property <length> diff-scroll-y;
+    in-out property <length> diff-visible-height;
+
+    // Pending discard: kind 0 none, 1 file, 2 hunk. The dialog shows while kind != 0.
+    in-out property <int> discard-kind: 0;
+    in-out property <string> discard-body;
+    in-out property <string> discard-path;
+    in-out property <int> discard-hunk-index;
+    in-out property <string> discard-header;
+    in-out property <string> discard-fingerprint;
+
     callback open-repo-dialog();
     callback open-recent(string);
     callback select-change(int, string);
     callback dismiss-error();
     callback dark-changed(bool);
+    callback move-selection(int);
+    callback stage-file();
+    callback unstage-file();
+    callback request-discard-file();
+    // (hunk index, header, fingerprint hex)
+    callback stage-hunk(int, string, string);
+    callback unstage-hunk(int, string, string);
+    callback request-discard-hunk(int, string, string);
+    callback confirm-discard();
+    callback cancel-discard();
+    callback load-full-diff();
+
+    forward-focus: keys;
 
     changed dark => {
         root.dark-changed(root.dark);
+    }
+
+    changed discard-kind => {
+        if root.discard-kind == 0 {
+            keys.focus();
+        }
+    }
+
+    // Window-level shortcuts. Slint reports the macOS Command key as `control`.
+    keys := FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(event) => {
+            if !root.has-repo || root.discard-kind != 0 {
+                return reject;
+            }
+            if event.text == Key.UpArrow && root.active-tab == 0 {
+                root.move-selection(-1);
+                return accept;
+            }
+            if event.text == Key.DownArrow && root.active-tab == 0 {
+                root.move-selection(1);
+                return accept;
+            }
+            if event.text == Key.Backspace && event.modifiers.control {
+                root.request-discard-file();
+                return accept;
+            }
+            if event.modifiers.control || event.modifiers.meta || event.modifiers.alt {
+                return reject;
+            }
+            if event.text == "s" {
+                root.stage-file();
+                return accept;
+            }
+            if event.text == "u" {
+                root.unstage-file();
+                return accept;
+            }
+            reject
+        }
     }
 
     VerticalLayout {
@@ -187,11 +267,13 @@ export component AppWindow inherits Window {
                             recent: root.recent;
                             open-recent(path) => {
                                 repo-popup.close();
+                                keys.focus();
                                 root.open-recent(path);
                             }
                             open-repo-dialog => {
                                 repo-popup.close();
                                 root.open-repo-dialog();
+                                keys.focus();
                             }
                         }
                     }
@@ -207,6 +289,7 @@ export component AppWindow inherits Window {
                         active: root.active-tab == 0;
                         clicked => {
                             root.active-tab = 0;
+                            keys.focus();
                         }
                     }
 
@@ -215,6 +298,7 @@ export component AppWindow inherits Window {
                         active: root.active-tab == 1;
                         clicked => {
                             root.active-tab = 1;
+                            keys.focus();
                         }
                     }
                 }
@@ -247,6 +331,7 @@ export component AppWindow inherits Window {
                     unstaged: root.unstaged;
                     select-change(side, path) => {
                         root.select-change(side, path);
+                        keys.focus();
                     }
                 }
 
@@ -286,7 +371,49 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                Rectangle {
+                if root.diff-mode != 3: DiffPane {
+                    vertical-stretch: 1;
+                    path: root.diff-path;
+                    side: root.diff-side;
+                    rows: root.diff-rows;
+                    mode: root.diff-mode;
+                    note: root.diff-note;
+                    left-title: root.left-title;
+                    right-title: root.right-title;
+                    additions: root.diff-additions;
+                    deletions: root.diff-deletions;
+                    hunk-actions: root.hunk-actions;
+                    scroll-y <=> root.diff-scroll-y;
+                    visible-height <=> root.diff-visible-height;
+                    stage-file => {
+                        root.stage-file();
+                        keys.focus();
+                    }
+                    unstage-file => {
+                        root.unstage-file();
+                        keys.focus();
+                    }
+                    request-discard-file => {
+                        root.request-discard-file();
+                    }
+                    stage-hunk(i, h, f) => {
+                        root.stage-hunk(i, h, f);
+                        keys.focus();
+                    }
+                    unstage-hunk(i, h, f) => {
+                        root.unstage-hunk(i, h, f);
+                        keys.focus();
+                    }
+                    request-discard-hunk(i, h, f) => {
+                        root.request-discard-hunk(i, h, f);
+                    }
+                    load-full-diff => {
+                        root.load-full-diff();
+                        keys.focus();
+                    }
+                }
+
+                if root.diff-mode == 3: Rectangle {
                     vertical-stretch: 1;
                     background: Theme.window-bg;
 
@@ -314,6 +441,20 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    if root.discard-kind != 0: ConfirmDialog {
+        width: root.width;
+        height: root.height;
+        title: "Discard changes?";
+        body: root.discard-body;
+        confirm-text: "Discard";
+        cancel => {
+            root.cancel-discard();
+        }
+        confirm => {
+            root.confirm-discard();
         }
     }
 

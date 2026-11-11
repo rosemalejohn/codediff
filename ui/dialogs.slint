@@ -113,3 +113,88 @@ export component ErrorBanner inherits Rectangle {
         }
     }
 }
+
+// Modal confirmation for destructive actions. Cancel is the default:
+// Escape and Return both cancel.
+export component ConfirmDialog inherits Rectangle {
+    in property <string> title;
+    in property <string> body;
+    in property <string> confirm-text;
+    callback cancel();
+    callback confirm();
+
+    background: Theme.scrim;
+
+    // Swallows clicks so nothing behind the dialog reacts.
+    TouchArea { }
+
+    keys := FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(event) => {
+            if event.text == Key.Escape || event.text == Key.Return {
+                root.cancel();
+                return accept;
+            }
+            accept
+        }
+    }
+
+    init => {
+        keys.focus();
+    }
+
+    card := Rectangle {
+        width: min(400px, root.width - 40px);
+        height: layout.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Theme.popup-bg;
+        border-color: Theme.border;
+        border-width: 1px;
+        border-radius: 8px;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #00000070;
+
+        layout := VerticalLayout {
+            padding: 18px;
+            spacing: 10px;
+
+            Text {
+                text: root.title;
+                color: Theme.text-strong;
+                font-size: 14px;
+                font-weight: 600;
+            }
+
+            Text {
+                text: root.body;
+                color: Theme.text;
+                font-size: Theme.font-size;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                padding-top: 6px;
+
+                FlatButton {
+                    text: "Cancel";
+                    primary: true;
+                    clicked => {
+                        root.cancel();
+                    }
+                }
+
+                FlatButton {
+                    text: root.confirm-text;
+                    danger: true;
+                    clicked => {
+                        root.confirm();
+                    }
+                }
+            }
+        }
+    }
+}

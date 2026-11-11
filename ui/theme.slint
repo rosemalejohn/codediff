@@ -29,12 +29,28 @@ export global Theme {
     out property <brush> letter-deleted: dark ? #e06c6c : #cf222e;
     out property <brush> letter-renamed: dark ? #8ab4f8 : #0969da;
 
+    // Diff pane.
+    out property <brush> add-bg: dark ? #1f3a24 : #e6ffec;
+    out property <brush> del-bg: dark ? #46252a : #ffebe9;
+    out property <brush> add-word: dark ? #2e6b38 : #abf2bc;
+    out property <brush> del-word: dark ? #7a333b : #ffc1bd;
+    out property <brush> hunk-bg: dark ? #25303d : #ddf4ff;
+    out property <brush> hunk-text: dark ? #8ab4f8 : #0969da;
+    out property <brush> stripe: dark ? #2a2b2f : #ececee;
+    out property <brush> gutter-text: dark ? #666a70 : #8c959f;
+    out property <brush> danger-bg: dark ? #a8383d : #cf222e;
+    out property <brush> danger-text: #ffffff;
+    out property <brush> scrim: dark ? #00000099 : #00000059;
+
     out property <length> font-size: 13px;
     out property <length> small-font-size: 11px;
     out property <length> row-height: 24px;
     out property <length> bar-height: 40px;
     out property <length> mono-font-size: 12px;
     out property <string> mono-font: "Menlo";
+    // Keep in sync with LINE_HEIGHT / HEADER_HEIGHT in src/ui_bridge.rs.
+    out property <length> diff-line-height: 18px;
+    out property <length> diff-header-height: 30px;
 
     public pure function letter-color(letter: string) -> brush {
         if letter == "A" {
@@ -57,18 +73,21 @@ export global Theme {
 export component FlatButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> small: false;
     callback clicked();
 
-    height: 26px;
-    min-width: label.preferred-width + 20px;
-    border-radius: 5px;
-    background: primary ? (touch.has-hover ? Theme.accent.darker(10%) : Theme.accent)
+    height: small ? 20px : 26px;
+    min-width: label.preferred-width + (small ? 14px : 20px);
+    border-radius: small ? 4px : 5px;
+    background: danger ? (touch.has-hover ? Theme.danger-bg.darker(15%) : Theme.danger-bg)
+        : primary ? (touch.has-hover ? Theme.accent.darker(10%) : Theme.accent)
         : (touch.has-hover ? Theme.button-hover : Theme.button-bg);
 
     label := Text {
         text: root.text;
-        color: root.primary ? Theme.accent-text : Theme.button-text;
-        font-size: Theme.font-size;
+        color: root.danger ? Theme.danger-text : root.primary ? Theme.accent-text : Theme.button-text;
+        font-size: root.small ? Theme.small-font-size : Theme.font-size;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
