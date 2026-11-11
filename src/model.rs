@@ -100,3 +100,17 @@ pub struct CommitInfo {
     /// Unix seconds.
     pub time: i64,
 }
+
+/// Content fingerprint of a hunk (header plus every line's kind and text).
+/// Stable within one process only; used to check a hunk command still targets
+/// exactly what the user saw.
+pub fn hunk_fingerprint(h: &Hunk) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut s = DefaultHasher::new();
+    h.header.hash(&mut s);
+    for l in &h.lines {
+        (l.kind as u8).hash(&mut s);
+        l.text.hash(&mut s);
+    }
+    s.finish()
+}

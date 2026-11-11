@@ -102,9 +102,13 @@ fn select_unstaged(h: &Harness, path: &str) -> codediff::controller::DiffView {
     }
 }
 
-fn hunk_headers(v: &codediff::controller::DiffView) -> Vec<String> {
+/// (header, fingerprint) of each hunk in the view, as the UI would send them.
+fn hunk_keys(v: &codediff::controller::DiffView) -> Vec<(String, u64)> {
     match &v.file.body {
-        DiffBody::Text(h) => h.iter().map(|h| h.header.clone()).collect(),
+        DiffBody::Text(h) => h
+            .iter()
+            .map(|h| (h.header.clone(), hunk_fingerprint(h)))
+            .collect(),
         other => panic!("not text: {other:?}"),
     }
 }
@@ -191,7 +195,7 @@ fn stale_hunk_emits_error_then_refresh() {
     let h = Harness::new();
     h.open(t.path());
     let v = select_unstaged(&h, "f.txt");
-    let real = hunk_headers(&v)[0].clone();
+    let (real, fp) = hunk_keys(&v)[0].clone();
 
     // Header differs from what the view showed.
     let m = h.mark();
@@ -199,6 +203,7 @@ fn stale_hunk_emits_error_then_refresh() {
         path: "f.txt".into(),
         hunk_index: 0,
         header: "@@ bogus @@".into(),
+        fingerprint: fp,
     });
     let (i_err, e) = h.wait_for(m, |e| matches!(e, Event::Error(_)));
     assert!(matches!(e, Event::Error(ref s) if s == "File changed, refreshed. Try again."));
@@ -210,6 +215,7 @@ fn stale_hunk_emits_error_then_refresh() {
         path: "f.txt".into(),
         hunk_index: 9,
         header: real.clone(),
+        fingerprint: fp,
     });
     let (i_err, _) = h.wait_for(m, |e| matches!(e, Event::Error(_)));
     h.wait_for(i_err, |e| matches!(e, Event::Status(_)));
@@ -220,6 +226,7 @@ fn stale_hunk_emits_error_then_refresh() {
         path: "f.txt".into(),
         hunk_index: 0,
         header: real,
+        fingerprint: fp,
     });
     let (i_err, _) = h.wait_for(m, |e| matches!(e, Event::Error(_)));
     h.wait_for(i_err, |e| matches!(e, Event::Status(_)));
@@ -237,12 +244,13 @@ fn stage_hunk_uses_current_view() {
     let h = Harness::new();
     h.open(t.path());
     let v = select_unstaged(&h, "f.txt");
-    let header = hunk_headers(&v)[0].clone();
+    let (header, fingerprint) = hunk_keys(&v)[0].clone();
     let m = h.mark();
     h.ctl.send(Command::StageHunk {
         path: "f.txt".into(),
         hunk_index: 0,
         header,
+        fingerprint,
     });
     h.wait_for(m, |e| status_has(e, &["f.txt"], &["f.txt"]));
     let idx = String::from_utf8(t.index_blob("f.txt").unwrap()).unwrap();
@@ -250,6 +258,105 @@ fn stage_hunk_uses_current_view() {
     assert!(!h.events.lock().unwrap()[m..]
         .iter()
         .any(|e| matches!(e, Event::Error(_))));
+}
+
+/// Sends `cmd`, expects the Stale error followed by a refresh Status.
+fn expect_stale(h: &Harness, cmd: Command) {
+    let m = h.mark();
+    h.ctl.send(cmd);
+    let (i_err, e) = h.wait_for(m, |e| matches!(e, Event::Error(_)));
+    assert!(matches!(e, Event::Error(ref s) if s == "File changed, refreshed. Try again."));
+    h.wait_for(i_err, |e| matches!(e, Event::Status(_)));
+}
+
+/// Waits for a refreshed unstaged Diff whose hunk 0 contains `needle`.
+fn wait_view_with(h: &Harness, from: usize, needle: &str) {
+    h.wait_for(from, |e| match e {
+        Event::Diff(Some(v)) => matches!(&v.file.body, DiffBody::Text(hs)
+            if hs[0].lines.iter().any(|l| l.text.contains(needle))),
+        _ => false,
+    });
+}
+
+#[test]
+fn stale_after_line_count_change_is_rejected() {
+    let t = two_hunk_repo();
+    let h = Harness::new();
+    h.open(t.path());
+    let v = select_unstaged(&h, "f.txt");
+    let (old_header, old_fp) = hunk_keys(&v)[0].clone();
+
+    let m = h.mark();
+    let edited = String::from_utf8(t.read("f.txt"))
+        .unwrap()
+        .replacen("two\n", "two\nextra\n", 1);
+    t.write("f.txt", edited.as_bytes());
+    wait_view_with(&h, m, "extra");
+
+    expect_stale(
+        &h,
+        Command::DiscardHunk {
+            path: "f.txt".into(),
+            hunk_index: 0,
+            header: old_header,
+            fingerprint: old_fp,
+        },
+    );
+    assert_eq!(t.read("f.txt"), edited.as_bytes(), "workdir untouched");
+    assert_eq!(
+        t.index_blob("f.txt").unwrap(),
+        numbered(),
+        "index untouched"
+    );
+}
+
+#[test]
+fn stale_after_same_header_rewrite_is_rejected() {
+    let t = two_hunk_repo();
+    let h = Harness::new();
+    h.open(t.path());
+    let v = select_unstaged(&h, "f.txt");
+    let (old_header, old_fp) = hunk_keys(&v)[0].clone();
+
+    let m = h.mark();
+    let edited = String::from_utf8(t.read("f.txt"))
+        .unwrap()
+        .replacen("two\n", "TWO\n", 1);
+    t.write("f.txt", edited.as_bytes());
+    wait_view_with(&h, m, "TWO");
+    let fresh = h.events.lock().unwrap().iter().rev().find_map(|e| match e {
+        Event::Diff(Some(v)) => Some(v.clone()),
+        _ => None,
+    });
+    let fresh = fresh.expect("refreshed view");
+    assert_eq!(
+        hunk_keys(&fresh)[0].0,
+        old_header,
+        "same header, new content"
+    );
+
+    for cmd in [
+        Command::StageHunk {
+            path: "f.txt".into(),
+            hunk_index: 0,
+            header: old_header.clone(),
+            fingerprint: old_fp,
+        },
+        Command::DiscardHunk {
+            path: "f.txt".into(),
+            hunk_index: 0,
+            header: old_header.clone(),
+            fingerprint: old_fp,
+        },
+    ] {
+        expect_stale(&h, cmd);
+    }
+    assert_eq!(t.read("f.txt"), edited.as_bytes(), "workdir untouched");
+    assert_eq!(
+        t.index_blob("f.txt").unwrap(),
+        numbered(),
+        "index untouched"
+    );
 }
 
 #[test]

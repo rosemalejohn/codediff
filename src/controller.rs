@@ -3,7 +3,8 @@ use crate::diff::{diff_stats, file_diff, files_in_target};
 use crate::highlight::{Highlighter, StyledRow};
 use crate::history::list_commits;
 use crate::model::{
-    ChangeSide, CommitInfo, DiffBody, DiffTarget, FileDiff, FileEntry, Hunk, StatusLists,
+    hunk_fingerprint, ChangeSide, CommitInfo, DiffBody, DiffTarget, FileDiff, FileEntry, Hunk,
+    StatusLists,
 };
 use crate::recent::RecentRepos;
 use crate::repo::{open_repo, repo_name};
@@ -52,16 +53,19 @@ pub enum Command {
         path: String,
         hunk_index: usize,
         header: String,
+        fingerprint: u64,
     },
     UnstageHunk {
         path: String,
         hunk_index: usize,
         header: String,
+        fingerprint: u64,
     },
     DiscardHunk {
         path: String,
         hunk_index: usize,
         header: String,
+        fingerprint: u64,
     },
     SetDark(bool),
     Shutdown,
@@ -173,6 +177,14 @@ struct Worker {
     view: Option<DiffView>,
 }
 
+/// A hunk command as the UI sent it.
+struct HunkReq {
+    path: String,
+    idx: usize,
+    header: String,
+    fingerprint: u64,
+}
+
 #[derive(Clone, Copy)]
 enum HunkOp {
     Stage,
@@ -251,17 +263,44 @@ impl Worker {
                 path,
                 hunk_index,
                 header,
-            } => self.hunk(HunkOp::Stage, path, hunk_index, header),
+                fingerprint,
+            } => self.hunk(
+                HunkOp::Stage,
+                HunkReq {
+                    path,
+                    idx: hunk_index,
+                    header,
+                    fingerprint,
+                },
+            ),
             Command::UnstageHunk {
                 path,
                 hunk_index,
                 header,
-            } => self.hunk(HunkOp::Unstage, path, hunk_index, header),
+                fingerprint,
+            } => self.hunk(
+                HunkOp::Unstage,
+                HunkReq {
+                    path,
+                    idx: hunk_index,
+                    header,
+                    fingerprint,
+                },
+            ),
             Command::DiscardHunk {
                 path,
                 hunk_index,
                 header,
-            } => self.hunk(HunkOp::Discard, path, hunk_index, header),
+                fingerprint,
+            } => self.hunk(
+                HunkOp::Discard,
+                HunkReq {
+                    path,
+                    idx: hunk_index,
+                    header,
+                    fingerprint,
+                },
+            ),
             Command::SetDark(dark) => {
                 self.dark = dark;
                 if self.view.is_some() {
@@ -504,7 +543,7 @@ impl Worker {
     }
 
     /// The hunk the user saw, if the request still matches the current view.
-    fn seen_hunk(&self, op: HunkOp, path: &str, idx: usize, header: &str) -> Option<Hunk> {
+    fn seen_hunk(&self, op: HunkOp, req: &HunkReq) -> Option<Hunk> {
         let v = self.view.as_ref()?;
         let side_ok = match op {
             HunkOp::Stage | HunkOp::Discard => v.side == Some(ChangeSide::Unstaged),
@@ -513,15 +552,19 @@ impl Worker {
         let DiffBody::Text(hunks) = &v.file.body else {
             return None;
         };
-        let h = hunks.get(idx)?;
-        (side_ok && v.file.path == path && h.header == header).then(|| h.clone())
+        let h = hunks.get(req.idx)?;
+        let same = v.file.path == req.path
+            && h.header == req.header
+            && hunk_fingerprint(h) == req.fingerprint;
+        (side_ok && same).then(|| h.clone())
     }
 
-    fn hunk(&mut self, op: HunkOp, path: String, idx: usize, header: String) {
-        let Some(expected) = self.seen_hunk(op, &path, idx, &header) else {
+    fn hunk(&mut self, op: HunkOp, req: HunkReq) {
+        let Some(expected) = self.seen_hunk(op, &req) else {
             self.emit(Event::Error(CoreError::Stale.to_string()));
             return self.refresh();
         };
+        let (path, idx) = (req.path, req.idx);
         self.mutate(|r| match op {
             HunkOp::Stage => stage::stage_hunk(r, &path, idx, &expected),
             HunkOp::Unstage => stage::unstage_hunk(r, &path, idx, &expected),
