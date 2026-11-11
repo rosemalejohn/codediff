@@ -27,7 +27,7 @@ fn plain(no: u32, kind: LineKind, text: &str) -> Cell {
 
 fn push_seg(segs: &mut Vec<Seg>, text: &str, changed: bool) {
     if let Some(last) = segs.last_mut() {
-        if last.changed == changed {
+        if changed && last.changed {
             last.text.push_str(text);
             return;
         }
