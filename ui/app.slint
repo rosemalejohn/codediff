@@ -149,6 +149,10 @@ export component AppWindow inherits Window {
     // False for History and for staged renames (file-level actions only).
     in-out property <bool> hunk-actions;
     in-out property <length> diff-scroll-y;
+    // Shared horizontal offset of both text columns (<= 0) and the width of the
+    // longest line's text, both set by the bridge.
+    in-out property <length> diff-scroll-x;
+    in-out property <length> diff-content-width;
     in-out property <length> diff-visible-height;
 
     // Pending discard: kind 0 none, 1 file, 2 hunk. The dialog shows while kind != 0.
@@ -444,6 +448,8 @@ export component AppWindow inherits Window {
                     hunk-actions: root.hunk-actions;
                     scroll-y <=> root.diff-scroll-y;
                     visible-height <=> root.diff-visible-height;
+                    scroll-x <=> root.diff-scroll-x;
+                    content-width: root.diff-content-width;
                     stage-file => {
                         root.stage-file();
                         keys.focus();

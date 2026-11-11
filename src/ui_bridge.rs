@@ -30,10 +30,24 @@ const DISCARD_HUNK: i32 = 2;
 // Theme.diff-header-height in ui/theme.slint.
 const LINE_HEIGHT: f32 = 18.0;
 const HEADER_HEIGHT: f32 = 30.0;
+// Advance of one Menlo character at Theme.mono-font-size (12px): an estimate
+// used only to size the horizontal scroll range.
+const CHAR_WIDTH: f32 = 7.3;
+const TEXT_END_PAD: f32 = 16.0;
 
 const HIST_NONE: i32 = 0;
 const HIST_COMMIT: i32 = 1;
 const HIST_RANGE: i32 = 2;
+
+/// Width of `cols` monospace columns of diff text plus its end padding.
+fn text_width(cols: usize) -> f32 {
+    cols as f32 * CHAR_WIDTH + TEXT_END_PAD
+}
+
+/// Columns of a cell's text as rendered (segments already tab-expanded).
+fn cell_cols(c: &CellData) -> usize {
+    c.segs.iter().map(|s| s.text.chars().count()).sum()
+}
 
 const STALE_MSG: &str = "File changed, refreshed. Try again.";
 
@@ -267,7 +281,7 @@ fn select_commit(w: &AppWindow, send: &impl Fn(Command), id: &str) {
     clear_new(w, id);
     set_history_selection(w, HIST_COMMIT, id, "", "");
     w.set_range_banner(SharedString::new());
-    w.set_diff_scroll_y(0.0);
+    reset_diff_scroll(w);
     send(Command::Select(Selection::Commit { id: oid, path: None }));
 }
 
@@ -277,7 +291,7 @@ fn select_range(w: &AppWindow, send: &impl Fn(Command), base: &str, head: &str, 
     let (Some(b), Some(h)) = (parse_oid(base), parse_oid(head)) else { return };
     set_history_selection(w, HIST_RANGE, "", base, head);
     w.set_range_follows_head(follows_head);
-    w.set_diff_scroll_y(0.0);
+    reset_diff_scroll(w);
     send(Command::Select(Selection::Range { base: b, head: h, path: None, follows_head }));
 }
 
@@ -311,6 +325,12 @@ fn history_titles(window: &AppWindow) {
     window.set_right_title(right.into());
 }
 
+/// Scrolls the diff pane back to its top-left corner.
+fn reset_diff_scroll(w: &AppWindow) {
+    w.set_diff_scroll_y(0.0);
+    w.set_diff_scroll_x(0.0);
+}
+
 /// Empties the diff pane (column titles are left to the caller).
 fn clear_diff(window: &AppWindow) {
     window.set_diff_rows(ModelRc::new(VecModel::<RowData>::default()));
@@ -323,7 +343,8 @@ fn clear_diff(window: &AppWindow) {
     window.set_diff_untracked(false);
     window.set_hunk_actions(false);
     window.set_diff_fingerprint(SharedString::new());
-    window.set_diff_scroll_y(0.0);
+    window.set_diff_content_width(0.0);
+    reset_diff_scroll(window);
 }
 
 fn apply_diff(window: &AppWindow, view: DiffView) {
@@ -361,6 +382,12 @@ fn apply_diff(window: &AppWindow, view: DiffView) {
         .iter()
         .map(|r| if r.is_header { HEADER_HEIGHT } else { LINE_HEIGHT })
         .sum();
+    let max_cols = rows
+        .iter()
+        .map(|r| cell_cols(&r.left).max(cell_cols(&r.right)))
+        .max()
+        .unwrap_or(0);
+    let content_width = if max_cols == 0 { 0.0 } else { text_width(max_cols) };
 
     match view.side {
         Some(ChangeSide::Unstaged) => {
@@ -391,12 +418,19 @@ fn apply_diff(window: &AppWindow, view: DiffView) {
     });
     window.set_diff_rows(ModelRc::new(VecModel::from(rows)));
 
-    let y = if same {
+    window.set_diff_content_width(content_width);
+
+    // The view clamps x to the visible text width; keep it within the content here.
+    let (x, y) = if same {
         let min_y = -(content_height - window.get_diff_visible_height()).max(0.0);
-        window.get_diff_scroll_y().clamp(min_y, 0.0)
+        (
+            window.get_diff_scroll_x().clamp(-content_width, 0.0),
+            window.get_diff_scroll_y().clamp(min_y, 0.0),
+        )
     } else {
-        0.0
+        (0.0, 0.0)
     };
+    window.set_diff_scroll_x(x);
     window.set_diff_scroll_y(y);
 }
 
@@ -739,7 +773,7 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         let Some(w) = weak.upgrade() else { return };
         w.set_commit_file(path);
         mark_files(&w);
-        w.set_diff_scroll_y(0.0);
+        reset_diff_scroll(&w);
         if let Some(sel) = history_selection(&w) {
             s(Command::Select(sel));
         }
@@ -761,7 +795,7 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     let weak = window.as_weak();
     window.on_tab_changed(move |tab| {
         let Some(w) = weak.upgrade() else { return };
-        w.set_diff_scroll_y(0.0);
+        reset_diff_scroll(&w);
         let sel = if tab == 0 {
             let side = w.get_selected_side();
             let path = w.get_selected_path();
@@ -1205,6 +1239,54 @@ mod tests {
         w.set_diff_scroll_y(-300.0);
         apply(&w, Event::Diff(Some(other)));
         assert_eq!(w.get_diff_scroll_y(), 0.0);
+    }
+
+    #[test]
+    fn content_width_follows_longest_line() {
+        let w = window();
+        let mut v = text_view("a.rs", Some(ChangeSide::Unstaged), FileStatus::Modified);
+        // Longest line is on the left; a tab counts as four columns.
+        v.rows.push(StyledRow::Line {
+            left: Some(StyledCell {
+                no: 9,
+                kind: LineKind::Removed,
+                segs: vec![seg("\tlet x"), seg(" = 1;")],
+            }),
+            right: Some(cell(9, LineKind::Added, "y")),
+        });
+        apply(&w, Event::Diff(Some(v)));
+        let cols = 4 + "let x = 1;".len();
+        assert!(text_width(cols) > text_width(cols - 1));
+        assert_eq!(w.get_diff_content_width(), text_width(cols));
+
+        apply(&w, Event::Diff(None));
+        assert_eq!(w.get_diff_content_width(), 0.0);
+    }
+
+    #[test]
+    fn horizontal_scroll_kept_on_refresh_reset_on_file_change() {
+        let w = window();
+        let (_log, send) = recorder();
+        wire(&w, send);
+        let v = text_view("a.rs", Some(ChangeSide::Unstaged), FileStatus::Modified);
+        apply(&w, Event::Diff(Some(v.clone())));
+        w.set_diff_scroll_x(-10.0);
+        apply(&w, Event::Diff(Some(v.clone())));
+        assert_eq!(w.get_diff_scroll_x(), -10.0, "same file refresh keeps it");
+        // Never further than the content is wide.
+        w.set_diff_scroll_x(-500.0);
+        apply(&w, Event::Diff(Some(v.clone())));
+        assert_eq!(w.get_diff_scroll_x(), -w.get_diff_content_width());
+
+        let mut other = v.clone();
+        other.file.path = "b.rs".into();
+        apply(&w, Event::Diff(Some(other)));
+        assert_eq!(w.get_diff_scroll_x(), 0.0, "file change resets it");
+
+        apply(&w, Event::Diff(Some(v)));
+        w.set_diff_scroll_x(-10.0);
+        w.invoke_tab_changed(1);
+        assert_eq!(w.get_diff_scroll_x(), 0.0, "tab change resets it");
     }
 
     #[test]

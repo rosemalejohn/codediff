@@ -38,8 +38,11 @@ component Stripes inherits Rectangle {
     }
 }
 
+// Gutter width plus gap before the text; keep in sync with DiffPane.text-area.
 component DiffCell inherits Rectangle {
     in property <CellData> cell;
+    // Horizontal text offset (<= 0) shared by both columns; the gutter stays put.
+    in property <length> offset;
     property <length> gutter: 44px;
     property <length> text-x: self.gutter + 8px;
 
@@ -66,26 +69,34 @@ component DiffCell inherits Rectangle {
         vertical-alignment: center;
     }
 
-    // Segments laid out at their natural width; long lines are clipped.
-    if root.cell.present: HorizontalLayout {
+    // Segments at their natural width, shifted by the shared offset and
+    // clipped to the text area so they never cover the gutter.
+    if root.cell.present: Rectangle {
         x: root.text-x;
-        width: max(self.preferred-width, root.width - root.text-x);
+        width: root.width - root.text-x;
         height: root.height;
-        alignment: start;
-        spacing: 0px;
+        clip: true;
 
-        for seg in root.cell.segs: Rectangle {
+        HorizontalLayout {
+            x: root.offset;
+            width: max(self.preferred-width, parent.width - root.offset);
+            height: parent.height;
+            alignment: start;
+            spacing: 0px;
+
+            for seg in root.cell.segs: Rectangle {
             background: !seg.changed ? transparent
                 : root.cell.kind == 1 ? Theme.add-word
                 : root.cell.kind == 2 ? Theme.del-word
                 : transparent;
 
-            Text {
-                text: seg.text;
-                color: seg.color == Colors.transparent ? Theme.text : seg.color;
-                font-family: Theme.mono-font;
-                font-size: Theme.mono-font-size;
-                vertical-alignment: center;
+                Text {
+                    text: seg.text;
+                    color: seg.color == Colors.transparent ? Theme.text : seg.color;
+                    font-family: Theme.mono-font;
+                    font-size: Theme.mono-font-size;
+                    vertical-alignment: center;
+                }
             }
         }
     }
@@ -149,6 +160,7 @@ component DiffRowView inherits Rectangle {
     in property <RowData> data;
     in property <int> side;
     in property <bool> actions;
+    in property <length> offset;
     callback stage-hunk(int, string, string);
     callback unstage-hunk(int, string, string);
     callback request-discard-hunk(int, string, string);
@@ -178,6 +190,7 @@ component DiffRowView inherits Rectangle {
         width: root.half;
         height: root.height;
         cell: root.data.left;
+        offset: root.offset;
     }
 
     if !root.data.is-header: Rectangle {
@@ -192,6 +205,7 @@ component DiffRowView inherits Rectangle {
         width: root.half;
         height: root.height;
         cell: root.data.right;
+        offset: root.offset;
     }
 }
 
@@ -208,6 +222,10 @@ export component DiffPane inherits Rectangle {
     in property <bool> hunk-actions;
     in-out property <length> scroll-y;
     in-out property <length> visible-height;
+    // Shared horizontal offset of both text columns (<= 0).
+    in-out property <length> scroll-x;
+    // Width of the longest line's text.
+    in property <length> content-width;
 
     callback stage-file();
     callback unstage-file();
@@ -330,28 +348,94 @@ export component DiffPane inherits Rectangle {
             }
         }
 
-        if root.mode == 0 && root.rows.length > 0: ListView {
+        if root.mode == 0 && root.rows.length > 0: pane := Rectangle {
+            // Visible text width of one column: half the rows minus the
+            // gutter and gap (DiffCell.text-x).
+            property <length> text-area: max(1px, (list.visible-width - 1px) / 2 - 52px);
+            property <length> max-x: max(0px, root.content-width - self.text-area);
+            // Effective offset: the stored one clamped to the current range.
+            property <length> hx: clamp(root.scroll-x, -self.max-x, 0px);
+
             vertical-stretch: 1;
-            content-y <=> root.scroll-y;
-            changed visible-height => {
-                root.visible-height = self.visible-height;
-            }
-            init => {
-                root.visible-height = self.visible-height;
+
+            // Below the list: gets the wheel events the list ignores, i.e.
+            // horizontal trackpad deltas and (off macOS) shift+wheel.
+            TouchArea {
+                scroll-event(e) => {
+                    if !e.modifiers.shift && e.delta-x != 0 {
+                        root.scroll-x = clamp(pane.hx + e.delta-x, -pane.max-x, 0px);
+                        return accept;
+                    }
+                    if e.modifiers.shift && (e.delta-x != 0 || e.delta-y != 0) {
+                        root.scroll-x = clamp(pane.hx + (e.delta-x != 0 ? e.delta-x : e.delta-y), -pane.max-x, 0px);
+                        return accept;
+                    }
+                    reject
+                }
             }
 
-            for row in root.rows: DiffRowView {
-                data: row;
-                side: root.side;
-                actions: root.hunk-actions;
-                stage-hunk(i, h, f) => {
-                    root.stage-hunk(i, h, f);
+            list := ListView {
+                height: parent.height - hbar.height;
+                y: 0px;
+                content-y <=> root.scroll-y;
+                changed visible-height => {
+                    root.visible-height = self.visible-height;
                 }
-                unstage-hunk(i, h, f) => {
-                    root.unstage-hunk(i, h, f);
+                init => {
+                    root.visible-height = self.visible-height;
                 }
-                request-discard-hunk(i, h, f) => {
-                    root.request-discard-hunk(i, h, f);
+
+                for row in root.rows: DiffRowView {
+                    data: row;
+                    side: root.side;
+                    actions: root.hunk-actions;
+                    offset: pane.hx;
+                    stage-hunk(i, h, f) => {
+                        root.stage-hunk(i, h, f);
+                    }
+                    unstage-hunk(i, h, f) => {
+                        root.unstage-hunk(i, h, f);
+                    }
+                    request-discard-hunk(i, h, f) => {
+                        root.request-discard-hunk(i, h, f);
+                    }
+                }
+            }
+
+            // Horizontal scrollbar for both columns; drag anywhere on it.
+            hbar := Rectangle {
+                property <length> thumb-w: max(24px, self.width * min(1, pane.text-area / max(1px, root.content-width)));
+                property <length> travel: max(1px, self.width - self.thumb-w);
+                property <length> drag-start;
+
+                y: parent.height - self.height;
+                height: pane.max-x > 0 ? 10px : 0px;
+                visible: pane.max-x > 0;
+                background: Theme.window-bg;
+
+                Rectangle {
+                    x: (-pane.hx / max(1px, pane.max-x)) * hbar.travel;
+                    y: 2px;
+                    width: hbar.thumb-w;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: hbar-touch.pressed || hbar-touch.has-hover ? Theme.scrollbar-active : Theme.scrollbar;
+                }
+
+                hbar-touch := TouchArea {
+                    pointer-event(e) => {
+                        if e.kind == PointerEventKind.down {
+                            hbar.drag-start = pane.hx;
+                        }
+                    }
+                    moved => {
+                        if self.pressed {
+                            root.scroll-x = clamp(
+                                hbar.drag-start - (self.mouse-x - self.pressed-x) / hbar.travel * pane.max-x,
+                                -pane.max-x,
+                                0px);
+                        }
+                    }
                 }
             }
         }
