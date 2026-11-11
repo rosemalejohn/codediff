@@ -7,16 +7,19 @@ cd "$(dirname "$0")/.."
 
 NAME=CodeDiff
 ID=com.codediff.app
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/{p;q}' Cargo.toml)
 DIST=dist
 APP="$DIST/$NAME.app"
+
+TMP_ROOT=$(mktemp -d)
+trap 'rm -rf "$TMP_ROOT"' EXIT
 
 cargo build --release
 rm -rf "$APP" "$DIST/$NAME.dmg"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/codediff "$APP/Contents/MacOS/codediff"
 
-ICONSET=$(mktemp -d)/AppIcon.iconset
+ICONSET=$TMP_ROOT/AppIcon.iconset
 mkdir -p "$ICONSET"
 for s in 16 32 128 256 512; do
   sips -z $s $s assets/icon.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
@@ -45,9 +48,9 @@ PLIST
 
 codesign --force --deep -s - "$APP"
 
-STAGE=$(mktemp -d)
+STAGE=$TMP_ROOT/stage
+mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "$NAME" -srcfolder "$STAGE" -ov -format UDZO "$DIST/$NAME.dmg"
-rm -rf "$STAGE"
 echo "Built $DIST/$NAME.dmg"

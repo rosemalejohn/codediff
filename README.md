@@ -31,8 +31,8 @@ The app is not notarized. After dragging it to Applications, the first launch is
 | Up / Down | Move selection in the file list (Changes tab) |
 | s | Stage the selected file |
 | u | Unstage the selected file |
-| Cmd+Backspace | Discard the selected file (asks for confirmation) |
-| Esc / Return | Dismiss or confirm dialogs |
+| Cmd+Backspace | Open the discard confirmation dialog for the selected file (never discards directly) |
+| Esc / Return | Cancel the open confirmation dialog |
 
 ## Performance
 
@@ -44,4 +44,4 @@ Measured on Apple Silicon with a release build, against a shallow clone of ripgr
 | Idle memory (RSS, repo open, 5 s idle) | under 100 MB | 93 to 98 MB |
 | Refresh after 50 file writes | under 300 ms | 161 to 173 ms from last write to the status update, including the 150 ms debounce |
 
-Idle memory is close to the limit. The refresh figure is measured at the controller level (`cargo run --release --example refresh_bench -- <repo>`), not through the rendered UI.
+Startup is measured to the first event-loop turn after `show()`, so it is approximate. Idle memory is close to the limit. The refresh figure is measured at the controller level (`cargo run --release --example refresh_bench -- <repo>`), not through the rendered UI.
