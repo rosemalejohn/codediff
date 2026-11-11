@@ -1,6 +1,7 @@
 //! CodeDiff library crate.
 pub mod diff;
 pub mod error;
+pub mod highlight;
 pub mod history;
 pub mod model;
 pub mod recent;
