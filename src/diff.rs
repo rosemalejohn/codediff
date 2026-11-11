@@ -29,7 +29,7 @@ pub(crate) fn unstaged_git_diff<'r>(
     Ok(repo.diff_index_to_workdir(None, Some(&mut o))?)
 }
 
-fn head_tree(repo: &Repository) -> Option<Tree<'_>> {
+pub(crate) fn head_tree(repo: &Repository) -> Option<Tree<'_>> {
     repo.head().ok().and_then(|h| h.peel_to_tree().ok())
 }
 
@@ -107,7 +107,7 @@ fn lossy(b: &[u8]) -> String {
     s.strip_suffix('\n').unwrap_or(&s).to_string()
 }
 
-fn delta_index(diff: &Diff<'_>, path: &str) -> Option<usize> {
+pub(crate) fn delta_index(diff: &Diff<'_>, path: &str) -> Option<usize> {
     diff.deltas().position(|d| {
         d.new_file().path().is_some_and(|p| p.to_str() == Some(path))
             || d.old_file().path().is_some_and(|p| p.to_str() == Some(path))

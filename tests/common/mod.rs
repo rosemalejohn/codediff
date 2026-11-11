@@ -42,6 +42,29 @@ impl TestRepo {
         idx.write().unwrap();
     }
 
+    /// Bytes of the stage-0 index entry for `rel`, or None when not in the index.
+    pub fn index_blob(&self, rel: &str) -> Option<Vec<u8>> {
+        let mut idx = self.repo.index().unwrap();
+        idx.read(false).unwrap();
+        let e = idx.get_path(Path::new(rel), 0)?;
+        Some(self.repo.find_blob(e.id).unwrap().content().to_vec())
+    }
+
+    /// Bytes of `rel` in the HEAD commit tree, or None when absent.
+    pub fn head_blob(&self, rel: &str) -> Option<Vec<u8>> {
+        let tree = self.repo.head().ok()?.peel_to_tree().ok()?;
+        let e = tree.get_path(Path::new(rel)).ok()?;
+        Some(self.repo.find_blob(e.id()).unwrap().content().to_vec())
+    }
+
+    pub fn exists(&self, rel: &str) -> bool {
+        self.path().join(rel).exists()
+    }
+
+    pub fn remove(&self, rel: &str) {
+        std::fs::remove_file(self.path().join(rel)).unwrap();
+    }
+
     pub fn commit(&self, msg: &str) -> Oid {
         let mut idx = self.repo.index().unwrap();
         let tree_id = idx.write_tree().unwrap();
