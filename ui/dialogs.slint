@@ -125,8 +125,12 @@ export component ConfirmDialog inherits Rectangle {
 
     background: Theme.scrim;
 
-    // Swallows clicks so nothing behind the dialog reacts.
-    TouchArea { }
+    // Swallows clicks and scrolling so nothing behind the dialog reacts.
+    TouchArea {
+        scroll-event(event) => {
+            accept
+        }
+    }
 
     keys := FocusScope {
         width: 0px;

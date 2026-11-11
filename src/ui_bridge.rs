@@ -360,6 +360,9 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     let weak = window.as_weak();
     window.on_stage_hunk(move |index, header, fingerprint| {
         let Some(w) = weak.upgrade() else { return };
+        if !w.get_hunk_actions() {
+            return;
+        }
         let Some(path) = shown_path(&w, SIDE_UNSTAGED) else { return };
         let Some((hunk_index, fingerprint)) = hunk_args(&w, index, &fingerprint) else { return };
         s(Command::StageHunk { path, hunk_index, header: header.into(), fingerprint });
@@ -380,12 +383,21 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     let weak = window.as_weak();
     window.on_request_discard_hunk(move |index, header, fingerprint| {
         let Some(w) = weak.upgrade() else { return };
+        if !w.get_hunk_actions() {
+            return;
+        }
         let Some(path) = shown_path(&w, SIDE_UNSTAGED) else { return };
         if hunk_args(&w, index, &fingerprint).is_none() {
             return;
         }
+        // Discarding a hunk of an untracked file deletes the whole file.
+        let body = if w.get_diff_untracked() {
+            format!("Delete untracked file {path}? This cannot be undone.")
+        } else {
+            format!("Discard this hunk in {path}? This cannot be undone.")
+        };
         clear_discard(&w);
-        w.set_discard_body(format!("Discard this hunk in {path}? This cannot be undone.").into());
+        w.set_discard_body(body.into());
         w.set_discard_path(path.into());
         w.set_discard_hunk_index(index);
         w.set_discard_header(header);
@@ -968,6 +980,35 @@ mod tests {
         assert_eq!(w.get_discard_kind(), 0);
         w.invoke_confirm_discard();
         assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn untracked_hunk_discard_says_delete() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply(&w, Event::Diff(Some(text_view("new.rs", Some(ChangeSide::Unstaged), FileStatus::Untracked))));
+        log.borrow_mut().clear();
+        w.invoke_request_discard_hunk(0, "@@ -1,1 +1,2 @@".into(), fp_hex().into());
+        assert!(log.borrow().is_empty());
+        assert_eq!(w.get_discard_kind(), 2);
+        assert_eq!(w.get_discard_body(), "Delete untracked file new.rs? This cannot be undone.");
+        w.invoke_confirm_discard();
+        assert!(matches!(log.borrow().as_slice(), [Command::DiscardHunk { path, .. }] if path == "new.rs"));
+    }
+
+    #[test]
+    fn hunk_requests_ignored_without_hunk_actions() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply(&w, Event::Diff(Some(text_view("a.rs", Some(ChangeSide::Unstaged), FileStatus::Modified))));
+        w.set_hunk_actions(false);
+        log.borrow_mut().clear();
+        w.invoke_stage_hunk(0, "@@ -1,1 +1,2 @@".into(), fp_hex().into());
+        w.invoke_request_discard_hunk(0, "@@ -1,1 +1,2 @@".into(), fp_hex().into());
+        assert!(log.borrow().is_empty());
+        assert_eq!(w.get_discard_kind(), 0);
     }
 
     #[test]
