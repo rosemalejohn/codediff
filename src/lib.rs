@@ -1,4 +1,5 @@
 //! CodeDiff library crate.
+pub mod controller;
 pub mod diff;
 pub mod error;
 pub mod highlight;
