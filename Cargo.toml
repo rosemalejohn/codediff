@@ -1,0 +1,26 @@
+[package]
+name = "codediff"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dirs = "7.0.0"
+git2 = "0.21.0"
+notify = "8.2.2"
+notify-debouncer-full = "0.7.0"
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+similar = "3.2.1"
+slint = "1.18.1"
+syntect = "5.3.0"
+thiserror = "2.0.21"
+
+[build-dependencies]
+slint-build = "1.18.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lib]
+path = "src/lib.rs"

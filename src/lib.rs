@@ -1,0 +1,1 @@
+//! CodeDiff library crate.
