@@ -2,7 +2,7 @@
 use crate::model::{DiffBody, DiffLine, DiffTarget, FileDiff, FileEntry, Hunk, LineKind};
 use crate::status::entry_from_delta;
 use crate::Result;
-use git2::{Diff, DiffFindOptions, DiffOptions, Patch, Repository, Tree};
+use git2::{Diff, DiffFindOptions, DiffOptions, ErrorCode, Patch, Repository, Tree};
 
 const MAX_LINES: usize = 5_000;
 const MAX_BLOB_BYTES: u64 = 2 * 1024 * 1024;
@@ -29,8 +29,14 @@ pub(crate) fn unstaged_git_diff<'r>(
     Ok(repo.diff_index_to_workdir(None, Some(&mut o))?)
 }
 
-pub(crate) fn head_tree(repo: &Repository) -> Option<Tree<'_>> {
-    repo.head().ok().and_then(|h| h.peel_to_tree().ok())
+/// HEAD tree, None when HEAD is unborn. Other errors propagate, so a transient
+/// HEAD read failure is an error rather than "every file Added".
+pub(crate) fn head_tree(repo: &Repository) -> Result<Option<Tree<'_>>> {
+    match repo.head() {
+        Ok(h) => Ok(Some(h.peel_to_tree()?)),
+        Err(e) if matches!(e.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// HEAD tree (empty when unborn) to index. Shared with hunk apply.
@@ -39,7 +45,7 @@ pub(crate) fn staged_git_diff<'r>(
     path: &str,
     reverse: bool,
 ) -> Result<Diff<'r>> {
-    let tree = head_tree(repo);
+    let tree = head_tree(repo)?;
     let mut o = base_opts(Some(path), reverse);
     Ok(repo.diff_tree_to_index(tree.as_ref(), None, Some(&mut o))?)
 }
@@ -86,7 +92,7 @@ fn tree_diff<'r>(
 fn full_diff<'r>(repo: &'r Repository, target: &DiffTarget) -> Result<Diff<'r>> {
     let mut d = match target {
         DiffTarget::Staged => {
-            let h = head_tree(repo);
+            let h = head_tree(repo)?;
             tree_diff(repo, h.as_ref(), None, None, true)?
         }
         DiffTarget::Unstaged => {

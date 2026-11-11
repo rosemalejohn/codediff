@@ -4,13 +4,13 @@
 //! builders `file_diff` uses, and the hunk at `hunk_index` must equal the `Hunk`
 //! the user saw (header, ranges, every line's kind, numbers and text). On any
 //! mismatch the call returns `CoreError::Stale` before anything is written.
-use crate::diff::{delta_index, files_in_target, staged_git_diff, unstaged_git_diff};
+use crate::diff::{delta_index, files_in_target, head_tree, staged_git_diff, unstaged_git_diff};
 use crate::model::{DiffTarget, FileStatus, Hunk, LineKind};
 use crate::{CoreError, Result};
 use git2::build::CheckoutBuilder;
 use git2::{
     ApplyLocation, ApplyOptions, Delta, Diff, ErrorCode, IndexEntry, IndexTime, Patch,
-    Repository, Status, Tree,
+    Repository, Status,
 };
 use std::cell::Cell;
 use std::path::{Component, Path, PathBuf};
@@ -33,15 +33,6 @@ fn check_path(path: &str) -> Result<()> {
 fn workdir_path(repo: &Repository, path: &str) -> Result<PathBuf> {
     let wd = repo.workdir().ok_or_else(|| invalid("Repository has no working directory"))?;
     Ok(wd.join(path))
-}
-
-/// HEAD tree, None when HEAD is unborn. Other errors propagate.
-fn head_tree_strict(repo: &Repository) -> Result<Option<Tree<'_>>> {
-    match repo.head() {
-        Ok(h) => Ok(Some(h.peel_to_tree()?)),
-        Err(e) if matches!(e.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
 }
 
 pub fn stage_file(repo: &Repository, path: &str) -> Result<()> {
@@ -70,7 +61,7 @@ fn staged_rename_source(repo: &Repository, path: &str) -> Result<Option<String>>
 /// paths: libgit2's `reset_default` treats paths as glob pathspecs, so a file
 /// named `[ab].txt` would also unstage `a.txt`. Workdir is never touched.
 fn reset_index_paths(repo: &Repository, paths: &[&str]) -> Result<()> {
-    let tree = head_tree_strict(repo)?;
+    let tree = head_tree(repo)?;
     let mut idx = repo.index()?;
     for p in paths {
         let pp = Path::new(p);

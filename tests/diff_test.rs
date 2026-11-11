@@ -195,3 +195,23 @@ fn rename_detected() {
     assert_eq!(d.status, FileStatus::Renamed);
     assert_eq!(d.old_path.as_deref(), Some("old.txt"));
 }
+
+#[test]
+fn staged_diff_errors_when_head_cannot_be_read() {
+    let t = TestRepo::new();
+    t.write("a.txt", b"1\n");
+    t.stage("a.txt");
+    t.commit("c");
+    t.write("a.txt", b"2\n");
+    t.stage("a.txt");
+    // HEAD's branch now names a commit that does not exist.
+    let head = t.repo.head().unwrap();
+    let branch = head.name().unwrap().to_string();
+    std::fs::write(
+        t.path().join(".git").join(&branch),
+        "1234567890123456789012345678901234567890\n",
+    )
+    .unwrap();
+    assert!(file_diff(&t.repo, &DiffTarget::Staged, "a.txt", false).is_err());
+    assert!(files_in_target(&t.repo, &DiffTarget::Staged).is_err());
+}
