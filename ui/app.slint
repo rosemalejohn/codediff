@@ -171,6 +171,9 @@ export component AppWindow inherits Window {
     in-out property <string> history-commit;
     in-out property <string> range-base;
     in-out property <string> range-head;
+    // The range ends at HEAD and moves with it (Review since here, or a
+    // shift-click whose newer end is the newest commit).
+    in-out property <bool> range-follows-head;
     in-out property <string> commit-file; // selected file in the strip
     in-out property <bool> history-loading;
     in-out property <bool> history-exhausted;

@@ -388,6 +388,7 @@ fn new_commit_marks_new_ids_and_extends_range() {
         base: c1,
         head: c2,
         path: None,
+        follows_head: true,
     }));
     let (_, e) = h.wait_for(m, |e| matches!(e, Event::Range(Some(_))));
     let Event::Range(Some(r)) = e else {
@@ -592,4 +593,83 @@ fn fresh_file_discard_discards() {
     assert!(!h.events.lock().unwrap()[m..]
         .iter()
         .any(|e| matches!(e, Event::Error(_))));
+}
+
+fn select_range(h: &Harness, base: Oid, head: Oid, follows_head: bool) -> usize {
+    let m = h.mark();
+    h.ctl.send(Command::Select(Selection::Range {
+        base,
+        head,
+        path: None,
+        follows_head,
+    }));
+    m
+}
+
+fn range_at(h: &Harness, from: usize) -> codediff::controller::RangeInfo {
+    match h.wait_for(from, |e| matches!(e, Event::Range(Some(_)))).1 {
+        Event::Range(Some(r)) => r,
+        _ => unreachable!(),
+    }
+}
+
+fn commit_file(t: &TestRepo, name: &str) -> Oid {
+    t.write(name, name.as_bytes());
+    t.stage(name);
+    t.commit(name)
+}
+
+#[test]
+fn follows_head_range_catches_up_after_tab_switch() {
+    let t = TestRepo::new();
+    let c1 = commit_file(&t, "a.txt");
+    let c2 = commit_file(&t, "b.txt");
+    let h = Harness::new();
+    h.open(t.path());
+    let m = select_range(&h, c1, c2, true);
+    assert_eq!(range_at(&h, m).head, c2);
+
+    // Switch to the Changes tab: the controller selection becomes a Change.
+    let m = h.mark();
+    h.ctl.send(Command::Select(Selection::Change {
+        side: ChangeSide::Unstaged,
+        path: "none.txt".into(),
+    }));
+    h.wait_for(m, |e| matches!(e, Event::Diff(None)));
+
+    // An agent commits while the range is not selected.
+    let m = h.mark();
+    let c3 = commit_file(&t, "c.txt");
+    h.wait_for(m, |e| matches!(e, Event::History { new_ids, .. } if new_ids == &vec![c3]));
+
+    // Back to History: the UI re-sends its stale head.
+    let m = select_range(&h, c1, c2, true);
+    let r = range_at(&h, m);
+    assert_eq!((r.base, r.head, r.commit_count), (c1, c3, 2));
+    h.wait_for(m, |e| matches!(e, Event::Files(f) if f.len() == 2));
+
+    // And it keeps following on later refreshes.
+    let m = h.mark();
+    let c4 = commit_file(&t, "d.txt");
+    let r = range_at(&h, m);
+    assert_eq!((r.head, r.commit_count), (c4, 3));
+}
+
+#[test]
+fn fixed_range_does_not_follow_head() {
+    let t = TestRepo::new();
+    let c1 = commit_file(&t, "a.txt");
+    let c2 = commit_file(&t, "b.txt");
+    let h = Harness::new();
+    h.open(t.path());
+    let m = select_range(&h, c1, c2, false);
+    assert_eq!(range_at(&h, m).head, c2);
+    let m = h.mark();
+    let c3 = commit_file(&t, "c.txt");
+    let (i, _) = h.wait_for(m, |e| matches!(e, Event::History { new_ids, .. } if new_ids == &vec![c3]));
+    // The refresh that reported c3 finishes with a Diff; no Range change before it.
+    let (j, _) = h.wait_for(i, |e| matches!(e, Event::Diff(_)));
+    assert!(!h.events.lock().unwrap()[m..=j]
+        .iter()
+        .any(|e| matches!(e, Event::Range(_))));
 }

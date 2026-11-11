@@ -36,6 +36,9 @@ pub enum Selection {
         base: Oid,
         head: Oid,
         path: Option<String>,
+        /// The range ends at HEAD: the worker sets `head` to the current HEAD on
+        /// select and on every refresh (the UI's `head` is only a hint).
+        follows_head: bool,
     },
 }
 
@@ -164,7 +167,6 @@ impl Drop for Controller {
 struct OpenRepo {
     repo: Repository,
     _watcher: Option<RepoWatcher>,
-    head: Option<Oid>,
     loaded: usize,
     seen: HashSet<Oid>,
 }
@@ -327,11 +329,9 @@ impl Worker {
         let mut recent = RecentRepos::load_from(&self.recent_file);
         recent.touch(root.clone());
         let _ = recent.save_to(&self.recent_file);
-        let head = head_id(&repo);
         self.open = Some(OpenRepo {
             repo,
             _watcher: watcher,
-            head,
             loaded: 0,
             seen: HashSet::new(),
         });
@@ -398,17 +398,13 @@ impl Worker {
     }
 
     fn refresh(&mut self) {
-        let Some(o) = &mut self.open else { return };
-        let old_head = o.head;
-        let new_head = head_id(&o.repo);
-        o.head = new_head;
+        if self.open.is_none() {
+            return;
+        }
         self.emit_status();
         self.emit_history_head(false);
-        if let (Selection::Range { head, .. }, Some(nh)) = (&mut self.selection, new_head) {
-            if Some(*head) == old_head && *head != nh {
-                *head = nh;
-                self.emit_range_and_files();
-            }
+        if self.follow_head() {
+            self.emit_range_and_files();
         }
         if !matches!(self.selection, Selection::None) && !self.emit_diff() {
             // The selected file has no diff any more.
@@ -420,14 +416,40 @@ impl Worker {
         }
     }
 
+    /// For a range that follows HEAD, moves its head to the current HEAD.
+    /// Returns true when the head changed.
+    fn follow_head(&mut self) -> bool {
+        let Some(o) = &self.open else { return false };
+        let Selection::Range {
+            head,
+            follows_head: true,
+            ..
+        } = &mut self.selection
+        else {
+            return false;
+        };
+        match head_id(&o.repo) {
+            Some(now) if now != *head => {
+                *head = now;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn select(&mut self, sel: Selection) {
         let was_range = matches!(self.selection, Selection::Range { .. });
         self.selection = sel;
         self.force_full = false;
+        let moved = self.follow_head();
         match &self.selection {
             Selection::Range { path: None, .. } => {
                 let files = self.emit_range_and_files();
                 self.auto_select_first(files);
+            }
+            Selection::Range { .. } if moved => {
+                self.emit_range_and_files();
+                self.emit_diff();
             }
             Selection::Range { base, head, .. } => {
                 let (base, head) = (*base, *head);
@@ -473,7 +495,7 @@ impl Worker {
                 Some(path.clone()),
             ),
             Selection::Commit { id, path } => (DiffTarget::Commit(*id), None, path.clone()),
-            Selection::Range { base, head, path } => (
+            Selection::Range { base, head, path, .. } => (
                 DiffTarget::Range {
                     base: *base,
                     head: *head,

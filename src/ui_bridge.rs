@@ -232,6 +232,7 @@ fn clear_commit_files(window: &AppWindow) {
 
 fn set_history_selection(w: &AppWindow, mode: i32, commit: &str, base: &str, head: &str) {
     w.set_history_mode(mode);
+    w.set_range_follows_head(false);
     w.set_history_commit(commit.into());
     w.set_range_base(base.into());
     w.set_range_head(head.into());
@@ -270,11 +271,14 @@ fn select_commit(w: &AppWindow, send: &impl Fn(Command), id: &str) {
     send(Command::Select(Selection::Commit { id: oid, path: None }));
 }
 
-fn select_range(w: &AppWindow, send: &impl Fn(Command), base: &str, head: &str) {
+/// `follows_head`: the controller keeps `head` at the current HEAD; the `head`
+/// sent here is only what the UI shows until the controller's Range event.
+fn select_range(w: &AppWindow, send: &impl Fn(Command), base: &str, head: &str, follows_head: bool) {
     let (Some(b), Some(h)) = (parse_oid(base), parse_oid(head)) else { return };
     set_history_selection(w, HIST_RANGE, "", base, head);
+    w.set_range_follows_head(follows_head);
     w.set_diff_scroll_y(0.0);
-    send(Command::Select(Selection::Range { base: b, head: h, path: None }));
+    send(Command::Select(Selection::Range { base: b, head: h, path: None, follows_head }));
 }
 
 /// The History tab's current selection, including the selected strip file.
@@ -287,6 +291,7 @@ fn history_selection(w: &AppWindow) -> Option<Selection> {
             base: parse_oid(&w.get_range_base())?,
             head: parse_oid(&w.get_range_head())?,
             path,
+            follows_head: w.get_range_follows_head(),
         }),
         _ => None,
     }
@@ -703,17 +708,19 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         };
         clear_new(&w, &id);
         let (base, head) = if a > b { (current, id) } else { (id, current) };
-        select_range(&w, &s, &base, &head);
+        // Row 0 is the newest loaded commit, i.e. HEAD as the UI knows it.
+        select_range(&w, &s, &base, &head, a.min(b) == 0);
     });
 
-    // "Review since here": base exclusive, up to HEAD (the newest loaded row).
+    // "Review since here": base exclusive, up to HEAD. The newest loaded row is
+    // only a placeholder head; the controller resolves the real HEAD.
     let s = send.clone();
     let weak = window.as_weak();
     window.on_review_since(move |id| {
         let Some(w) = weak.upgrade() else { return };
         let Some(head) = w.get_commits().row_data(0).map(|r| r.id) else { return };
         clear_new(&w, &id);
-        select_range(&w, &s, &id, &head);
+        select_range(&w, &s, &id, &head, true);
     });
 
     let s = send.clone();
@@ -1564,7 +1571,7 @@ mod tests {
         w.invoke_review_since(id("c1"));
         assert!(matches!(
             log.borrow().as_slice(),
-            [Command::Select(Selection::Range { base, head, path: None })]
+            [Command::Select(Selection::Range { base, head, path: None, follows_head: true })]
                 if *base == oid("c1") && *head == oid("c3")
         ));
         assert_eq!(w.get_history_mode(), 2);
@@ -1585,12 +1592,53 @@ mod tests {
         w.invoke_shift_select_commit(id("c2"));
         assert!(matches!(
             log.borrow().as_slice(),
-            [Command::Select(Selection::Range { base, head, path: None })]
+            [Command::Select(Selection::Range { base, head, path: None, follows_head: false })]
                 if *base == oid("c1") && *head == oid("c2")
         ));
         assert!(!row(&w, 0).in_range);
         assert!(row(&w, 1).in_range);
         assert!(!row(&w, 2).in_range);
+    }
+
+    #[test]
+    fn shift_click_to_newest_row_follows_head() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        w.invoke_select_commit(id("c3"));
+        log.borrow_mut().clear();
+        w.invoke_shift_select_commit(id("c1"));
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Range { base, head, follows_head: true, .. })]
+                if *base == oid("c1") && *head == oid("c3")
+        ));
+    }
+
+    #[test]
+    fn tab_change_resends_following_range() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        w.invoke_review_since(id("c1"));
+        w.invoke_tab_changed(0);
+        log.borrow_mut().clear();
+        w.invoke_tab_changed(1);
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Range { follows_head: true, .. })]
+        ));
+        // A fixed range stays fixed.
+        w.invoke_select_commit(id("c1"));
+        w.invoke_shift_select_commit(id("c2"));
+        log.borrow_mut().clear();
+        w.invoke_tab_changed(1);
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Range { follows_head: false, .. })]
+        ));
     }
 
     #[test]
@@ -1713,7 +1761,7 @@ mod tests {
         w.invoke_select_commit_file("a.rs".into());
         assert!(matches!(
             log.borrow().as_slice(),
-            [Command::Select(Selection::Range { base, head, path: Some(p) })]
+            [Command::Select(Selection::Range { base, head, path: Some(p), .. })]
                 if *base == oid("c1") && *head == oid("c3") && p == "a.rs"
         ));
     }
