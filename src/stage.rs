@@ -1,11 +1,11 @@
 //! Stage, unstage and discard, for whole files and single hunks.
 //!
 //! Hunk operations are guarded: the hunk list is recomputed from the same diff
-//! builders `file_diff` uses, and the caller's `expected_header` must match the
-//! header at `hunk_index`. On any mismatch the call returns `CoreError::Stale`
-//! before anything is written.
+//! builders `file_diff` uses, and the hunk at `hunk_index` must equal the `Hunk`
+//! the user saw (header, ranges, every line's kind, numbers and text). On any
+//! mismatch the call returns `CoreError::Stale` before anything is written.
 use crate::diff::{delta_index, files_in_target, staged_git_diff, unstaged_git_diff};
-use crate::model::{DiffTarget, FileStatus};
+use crate::model::{DiffTarget, FileStatus, Hunk, LineKind};
 use crate::{CoreError, Result};
 use git2::build::CheckoutBuilder;
 use git2::{
@@ -149,6 +149,16 @@ pub fn discard_file(repo: &Repository, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// One diff line as git2 reports it: origin char (' ', '+', '-', or the
+/// end-of-file newline markers '=', '>', '<'), line numbers and raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineSig {
+    origin: char,
+    old_no: Option<u32>,
+    new_no: Option<u32>,
+    content: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HunkSig {
     header: String,
@@ -156,9 +166,10 @@ struct HunkSig {
     old_lines: u32,
     new_start: u32,
     new_lines: u32,
+    lines: Vec<LineSig>,
 }
 
-/// Delta status and hunk signatures of `path` in `diff`, None when absent.
+/// Delta status and full hunk signatures of `path` in `diff`, None when absent.
 fn hunk_sigs(diff: &Diff<'_>, path: &str) -> Result<Option<(Delta, Vec<HunkSig>)>> {
     let Some(i) = delta_index(diff, path) else {
         return Ok(None);
@@ -169,73 +180,125 @@ fn hunk_sigs(diff: &Diff<'_>, path: &str) -> Result<Option<(Delta, Vec<HunkSig>)
     let status = patch.delta().status();
     let mut out = Vec::with_capacity(patch.num_hunks());
     for h in 0..patch.num_hunks() {
-        let (hd, _) = patch.hunk(h)?;
+        let (hd, n) = patch.hunk(h)?;
+        let mut lines = Vec::with_capacity(n);
+        for l in 0..n {
+            let line = patch.line_in_hunk(h, l)?;
+            lines.push(LineSig {
+                origin: line.origin(),
+                old_no: line.old_lineno(),
+                new_no: line.new_lineno(),
+                content: line.content().to_vec(),
+            });
+        }
         out.push(HunkSig {
             header: String::from_utf8_lossy(hd.header()).trim().to_string(),
             old_start: hd.old_start(),
             old_lines: hd.old_lines(),
             new_start: hd.new_start(),
             new_lines: hd.new_lines(),
+            lines,
         });
     }
     Ok(Some((status, out)))
 }
 
-/// Checks `expected_header` against the forward diff. Returns the delta status
-/// and all forward hunk signatures, or `Stale`.
+/// Same text rule as `diff::build` (lossy UTF-8, one trailing newline stripped).
+fn display_text(b: &[u8]) -> String {
+    let s = String::from_utf8_lossy(b);
+    s.strip_suffix('\n').unwrap_or(&s).to_string()
+}
+
+/// True when the freshly computed hunk is exactly what the user saw: header,
+/// ranges, and every displayed line's kind, line numbers and text.
+fn matches_viewed(sig: &HunkSig, seen: &Hunk) -> bool {
+    if sig.header != seen.header.trim()
+        || (sig.old_start, sig.old_lines, sig.new_start, sig.new_lines)
+            != (seen.old_start, seen.old_lines, seen.new_start, seen.new_lines)
+    {
+        return false;
+    }
+    let shown = sig.lines.iter().filter_map(|l| {
+        let kind = match l.origin {
+            ' ' => LineKind::Context,
+            '+' => LineKind::Added,
+            '-' => LineKind::Removed,
+            _ => return None,
+        };
+        Some((kind, l.old_no, l.new_no, display_text(&l.content)))
+    });
+    let viewed = seen.lines.iter().map(|l| (l.kind, l.old_no, l.new_no, l.text.clone()));
+    shown.eq(viewed)
+}
+
+/// Checks the viewed hunk against the forward diff. Returns the delta status and
+/// all forward hunk signatures, or `Stale`.
 fn guard(
     forward: &Diff<'_>,
     path: &str,
     hunk_index: usize,
-    expected_header: &str,
+    expected: &Hunk,
 ) -> Result<(Delta, Vec<HunkSig>)> {
     let Some((status, sigs)) = hunk_sigs(forward, path)? else {
         return Err(CoreError::Stale);
     };
     match sigs.get(hunk_index) {
-        Some(s) if s.header == expected_header.trim() => Ok((status, sigs)),
+        Some(s) if matches_viewed(s, expected) => Ok((status, sigs)),
         _ => Err(CoreError::Stale),
     }
 }
 
-/// Applies only the `hunk_index`-th hunk of `path` from `diff` at `location`.
-/// `forward` are the hunks the caller verified; when `diff` is the reversed diff
-/// it must be their exact mirror, otherwise the file moved in between and we
-/// return `Stale` without writing.
-fn apply_one(
+/// `r` is the reversed-diff counterpart of forward line `f`: same bytes, old and
+/// new swapped, additions and removals (and the EOF newline markers) swapped.
+fn line_mirrors(r: &LineSig, f: &LineSig) -> bool {
+    let flipped = match f.origin {
+        '+' => '-',
+        '-' => '+',
+        '>' => '<',
+        '<' => '>',
+        o => o,
+    };
+    r.origin == flipped && r.old_no == f.new_no && r.new_no == f.old_no && r.content == f.content
+}
+
+fn hunk_mirrors(r: &HunkSig, f: &HunkSig) -> bool {
+    if (r.old_start, r.old_lines, r.new_start, r.new_lines)
+        != (f.new_start, f.new_lines, f.old_start, f.old_lines)
+    {
+        return false;
+    }
+    // Within a hunk git2 emits removals before additions; the reversed hunk keeps
+    // positions but swaps the two kinds, so compare each kind's sequence plus the
+    // context sequence instead of raw order.
+    let pick = |v: &[LineSig], o: &[char]| -> Vec<LineSig> {
+        v.iter().filter(|l| o.contains(&l.origin)).cloned().collect()
+    };
+    let pairs = [
+        (vec![' ', '='], vec![' ', '=']),
+        (vec!['-', '<'], vec!['+', '>']),
+        (vec!['+', '>'], vec!['-', '<']),
+    ];
+    pairs.iter().all(|(ro, fo)| {
+        let a = pick(&r.lines, ro);
+        let b = pick(&f.lines, fo);
+        a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| line_mirrors(x, y))
+    })
+}
+
+/// Runs `repo.apply` accepting only the `hunk_index`-th hunk of `path`. Returns
+/// how many hunks the callback accepted. With `check` nothing is written.
+fn run_apply(
     repo: &Repository,
     diff: &Diff<'_>,
     path: &str,
     hunk_index: usize,
-    forward: &[HunkSig],
-    reversed: bool,
     location: ApplyLocation,
-) -> Result<()> {
-    let Some((status, sigs)) = hunk_sigs(diff, path)? else {
-        return Err(CoreError::Stale);
-    };
-    // libgit2 applies Added and Deleted deltas as a whole and never calls the hunk
-    // callback for them. Such a delta has exactly one hunk, so applying it whole is
-    // the same as applying that hunk; anything else is refused.
-    let whole_file = matches!(status, Delta::Added | Delta::Deleted);
-    if whole_file && (sigs.len() != 1 || hunk_index != 0) {
-        return Err(CoreError::Stale);
-    }
-    let mirrors = sigs.len() == forward.len()
-        && sigs.iter().zip(forward).all(|(a, f)| {
-            if reversed {
-                (a.old_start, a.old_lines, a.new_start, a.new_lines)
-                    == (f.new_start, f.new_lines, f.old_start, f.old_lines)
-            } else {
-                a == f
-            }
-        });
-    if !mirrors {
-        return Err(CoreError::Stale);
-    }
+    check: bool,
+) -> Result<usize> {
     let seen = Cell::new(0usize);
     let applied = Cell::new(0usize);
     let mut opts = ApplyOptions::new();
+    opts.check(check);
     opts.delta_callback(|d| {
         d.is_some_and(|d| {
             [d.new_file().path(), d.old_file().path()]
@@ -254,8 +317,45 @@ fn apply_one(
         take
     });
     repo.apply(diff, location, Some(&mut opts))?;
-    if !whole_file {
-        debug_assert_eq!(applied.get(), 1, "exactly one hunk must be applied");
+    Ok(applied.get())
+}
+
+/// Applies only the `hunk_index`-th hunk of `path` from `diff` at `location`.
+/// `forward` are the hunks the caller verified; `diff` must match them exactly
+/// (or mirror them exactly when `reversed`), including every line's bytes,
+/// otherwise the file moved in between and we return `Stale` without writing.
+fn apply_one(
+    repo: &Repository,
+    diff: &Diff<'_>,
+    path: &str,
+    hunk_index: usize,
+    forward: &[HunkSig],
+    reversed: bool,
+    location: ApplyLocation,
+) -> Result<()> {
+    let Some((status, sigs)) = hunk_sigs(diff, path)? else {
+        return Err(CoreError::Stale);
+    };
+    // libgit2 applies a Deleted delta as a whole and never calls the hunk callback
+    // for it. Added and Deleted deltas have exactly one hunk, so applying them whole
+    // is the same as applying that hunk; any other shape is refused.
+    let whole_file = matches!(status, Delta::Added | Delta::Deleted);
+    if whole_file && (sigs.len() != 1 || hunk_index != 0) {
+        return Err(CoreError::Stale);
+    }
+    let consistent = sigs.len() == forward.len()
+        && sigs.iter().zip(forward).all(|(a, f)| if reversed { hunk_mirrors(a, f) } else { a == f });
+    if !consistent {
+        return Err(CoreError::Stale);
+    }
+    // Dry run first: the real apply only happens when exactly the one hunk would
+    // be applied (a Deleted delta reports zero, see above).
+    let want = if status == Delta::Deleted { 0 } else { 1 };
+    if run_apply(repo, diff, path, hunk_index, location, true)? != want {
+        return Err(CoreError::Stale);
+    }
+    if run_apply(repo, diff, path, hunk_index, location, false)? != want {
+        return Err(CoreError::Stale);
     }
     Ok(())
 }
@@ -264,11 +364,11 @@ pub fn stage_hunk(
     repo: &Repository,
     path: &str,
     hunk_index: usize,
-    expected_header: &str,
+    expected: &Hunk,
 ) -> Result<()> {
     check_path(path)?;
     let diff = unstaged_git_diff(repo, path, false)?;
-    let (status, sigs) = guard(&diff, path, hunk_index, expected_header)?;
+    let (status, sigs) = guard(&diff, path, hunk_index, expected)?;
     if status == Delta::Untracked {
         return stage_file(repo, path);
     }
@@ -279,11 +379,11 @@ pub fn unstage_hunk(
     repo: &Repository,
     path: &str,
     hunk_index: usize,
-    expected_header: &str,
+    expected: &Hunk,
 ) -> Result<()> {
     check_path(path)?;
     let forward = staged_git_diff(repo, path, false)?;
-    let (_, sigs) = guard(&forward, path, hunk_index, expected_header)?;
+    let (_, sigs) = guard(&forward, path, hunk_index, expected)?;
     let reversed = staged_git_diff(repo, path, true)?;
     apply_one(repo, &reversed, path, hunk_index, &sigs, true, ApplyLocation::Index)
 }
@@ -292,11 +392,11 @@ pub fn discard_hunk(
     repo: &Repository,
     path: &str,
     hunk_index: usize,
-    expected_header: &str,
+    expected: &Hunk,
 ) -> Result<()> {
     check_path(path)?;
     let forward = unstaged_git_diff(repo, path, false)?;
-    let (status, sigs) = guard(&forward, path, hunk_index, expected_header)?;
+    let (status, sigs) = guard(&forward, path, hunk_index, expected)?;
     if status == Delta::Untracked {
         return discard_file(repo, path);
     }

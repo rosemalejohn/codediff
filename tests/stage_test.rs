@@ -29,11 +29,23 @@ fn two_hunk_file() -> TestRepo {
     t
 }
 
-fn headers(t: &TestRepo, target: DiffTarget, path: &str) -> Vec<String> {
+fn hunks(t: &TestRepo, target: DiffTarget, path: &str) -> Vec<Hunk> {
     let d = file_diff(&t.repo, &target, path, false).unwrap().expect("diff");
     match d.body {
-        DiffBody::Text(h) => h.into_iter().map(|h| h.header).collect(),
+        DiffBody::Text(h) => h,
         other => panic!("expected text, got {other:?}"),
+    }
+}
+
+/// A Hunk the user never saw: only the header is set.
+fn fake(header: &str) -> Hunk {
+    Hunk {
+        header: header.into(),
+        old_start: 1,
+        old_lines: 1,
+        new_start: 1,
+        new_lines: 1,
+        lines: vec![],
     }
 }
 
@@ -140,7 +152,7 @@ fn unstage_file_on_staged_rename_unstages_both_sides() {
 #[test]
 fn unstage_hunk_on_staged_rename_is_stale_and_changes_nothing() {
     let t = staged_rename();
-    let hs = headers(&t, DiffTarget::Staged, "new.txt");
+    let hs = hunks(&t, DiffTarget::Staged, "new.txt");
     let before_new = t.index_blob("new.txt");
     let before_old = t.index_blob("old.txt");
     assert!(is_stale(unstage_hunk(&t.repo, "new.txt", 0, &hs[0])));
@@ -200,13 +212,13 @@ fn discard_untracked_deletes_it() {
 #[test]
 fn two_hunk_fixture_has_two_hunks() {
     let t = two_hunk_file();
-    assert_eq!(headers(&t, DiffTarget::Unstaged, F).len(), 2);
+    assert_eq!(hunks(&t, DiffTarget::Unstaged, F).len(), 2);
 }
 
 #[test]
 fn stage_hunk_stages_only_that_hunk() {
     let t = two_hunk_file();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     stage_hunk(&t.repo, F, 1, &hs[1]).unwrap();
     assert_eq!(t.index_blob(F).unwrap(), with_edits(&[(18, "eighteen")]));
     assert_eq!(t.read(F), with_edits(&[(2, "two"), (18, "eighteen")]));
@@ -215,7 +227,7 @@ fn stage_hunk_stages_only_that_hunk() {
 #[test]
 fn stage_hunk_zero_stages_only_first() {
     let t = two_hunk_file();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     stage_hunk(&t.repo, F, 0, &hs[0]).unwrap();
     assert_eq!(t.index_blob(F).unwrap(), with_edits(&[(2, "two")]));
     assert_eq!(t.read(F), with_edits(&[(2, "two"), (18, "eighteen")]));
@@ -225,7 +237,7 @@ fn stage_hunk_zero_stages_only_first() {
 fn unstage_hunk_unstages_only_that_hunk() {
     let t = two_hunk_file();
     stage_file(&t.repo, F).unwrap();
-    let hs = headers(&t, DiffTarget::Staged, F);
+    let hs = hunks(&t, DiffTarget::Staged, F);
     assert_eq!(hs.len(), 2);
     unstage_hunk(&t.repo, F, 0, &hs[0]).unwrap();
     assert_eq!(t.index_blob(F).unwrap(), with_edits(&[(18, "eighteen")]));
@@ -237,7 +249,7 @@ fn unstage_hunk_of_staged_new_file_removes_it_from_index() {
     let t = two_hunk_file();
     t.write("n.txt", b"a\nb\n");
     t.stage("n.txt");
-    let hs = headers(&t, DiffTarget::Staged, "n.txt");
+    let hs = hunks(&t, DiffTarget::Staged, "n.txt");
     unstage_hunk(&t.repo, "n.txt", 0, &hs[0]).unwrap();
     assert!(t.index_blob("n.txt").is_none());
     assert_eq!(t.read("n.txt"), b"a\nb\n");
@@ -246,7 +258,7 @@ fn unstage_hunk_of_staged_new_file_removes_it_from_index() {
 #[test]
 fn discard_hunk_discards_only_that_hunk() {
     let t = two_hunk_file();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     discard_hunk(&t.repo, F, 0, &hs[0]).unwrap();
     assert_eq!(t.read(F), with_edits(&[(18, "eighteen")]));
     assert_eq!(t.index_blob(F).unwrap(), numbered());
@@ -255,9 +267,9 @@ fn discard_hunk_discards_only_that_hunk() {
 #[test]
 fn discard_hunk_keeps_staged_changes() {
     let t = two_hunk_file();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     stage_hunk(&t.repo, F, 0, &hs[0]).unwrap();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     assert_eq!(hs.len(), 1);
     discard_hunk(&t.repo, F, 0, &hs[0]).unwrap();
     assert_eq!(t.read(F), with_edits(&[(2, "two")]));
@@ -269,15 +281,62 @@ fn stage_hunk_refuses_stale_header() {
     let t = two_hunk_file();
     let idx_before = t.index_blob(F);
     let wd_before = t.read(F);
-    assert!(is_stale(stage_hunk(&t.repo, F, 0, "@@ -1,1 +1,1 @@")));
+    let mut h = hunks(&t, DiffTarget::Unstaged, F).remove(0);
+    h.header = "@@ -1,1 +1,1 @@".into();
+    assert!(is_stale(stage_hunk(&t.repo, F, 0, &h)));
     assert_eq!(t.index_blob(F), idx_before);
     assert_eq!(t.read(F), wd_before);
 }
 
 #[test]
+fn stage_hunk_refuses_altered_line_text() {
+    let t = two_hunk_file();
+    let mut h = hunks(&t, DiffTarget::Unstaged, F).remove(0);
+    let added = h.lines.iter_mut().find(|l| l.kind == LineKind::Added).unwrap();
+    added.text = "TWO".into();
+    assert!(is_stale(stage_hunk(&t.repo, F, 0, &h)));
+    assert_eq!(t.index_blob(F).unwrap(), numbered());
+}
+
+#[test]
+fn stage_hunk_refuses_same_length_edit() {
+    let t = two_hunk_file();
+    let viewed = hunks(&t, DiffTarget::Unstaged, F).remove(0);
+    let changed = with_edits(&[(2, "TWO"), (18, "eighteen")]);
+    t.write(F, &changed);
+    assert_eq!(hunks(&t, DiffTarget::Unstaged, F)[0].header, viewed.header);
+    assert!(is_stale(stage_hunk(&t.repo, F, 0, &viewed)));
+    assert_eq!(t.index_blob(F).unwrap(), numbered());
+    assert_eq!(t.read(F), changed);
+}
+
+#[test]
+fn discard_hunk_refuses_same_length_edit() {
+    let t = two_hunk_file();
+    let viewed = hunks(&t, DiffTarget::Unstaged, F).remove(0);
+    let changed = with_edits(&[(2, "TWO"), (18, "eighteen")]);
+    t.write(F, &changed);
+    assert!(is_stale(discard_hunk(&t.repo, F, 0, &viewed)));
+    assert_eq!(t.index_blob(F).unwrap(), numbered());
+    assert_eq!(t.read(F), changed);
+}
+
+#[test]
+fn unstage_hunk_refuses_same_length_edit() {
+    let t = two_hunk_file();
+    stage_file(&t.repo, F).unwrap();
+    let viewed = hunks(&t, DiffTarget::Staged, F).remove(0);
+    t.write(F, &with_edits(&[(2, "TWO"), (18, "eighteen")]));
+    stage_file(&t.repo, F).unwrap();
+    let before = t.index_blob(F);
+    assert!(is_stale(unstage_hunk(&t.repo, F, 0, &viewed)));
+    assert_eq!(t.index_blob(F), before);
+}
+
+#[test]
 fn stage_hunk_out_of_range_is_stale() {
     let t = two_hunk_file();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     let idx_before = t.index_blob(F);
     assert!(is_stale(stage_hunk(&t.repo, F, 5, &hs[0])));
     assert_eq!(t.index_blob(F), idx_before);
@@ -287,16 +346,16 @@ fn stage_hunk_out_of_range_is_stale() {
 fn hunk_ops_on_unchanged_file_are_stale() {
     let t = two_hunk_file();
     discard_file(&t.repo, F).unwrap();
-    assert!(is_stale(stage_hunk(&t.repo, F, 0, "@@ -1,5 +1,5 @@")));
-    assert!(is_stale(discard_hunk(&t.repo, F, 0, "@@ -1,5 +1,5 @@")));
-    assert!(is_stale(unstage_hunk(&t.repo, F, 0, "@@ -1,5 +1,5 @@")));
+    assert!(is_stale(stage_hunk(&t.repo, F, 0, &fake("@@ -1,5 +1,5 @@"))));
+    assert!(is_stale(discard_hunk(&t.repo, F, 0, &fake("@@ -1,5 +1,5 @@"))));
+    assert!(is_stale(unstage_hunk(&t.repo, F, 0, &fake("@@ -1,5 +1,5 @@"))));
     assert_eq!(t.read(F), numbered());
 }
 
 #[test]
 fn discard_hunk_refuses_when_file_changed_since_viewed() {
     let t = two_hunk_file();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     // File edited after the diff was shown: an extra line shifts hunk 0.
     let changed = with_edits(&[(1, "1\nextra"), (2, "two"), (18, "eighteen")]);
     t.write(F, &changed);
@@ -310,8 +369,8 @@ fn unstage_hunk_refuses_stale_header() {
     let t = two_hunk_file();
     stage_file(&t.repo, F).unwrap();
     let before = t.index_blob(F);
-    assert!(is_stale(unstage_hunk(&t.repo, F, 0, "@@ -1,1 +1,1 @@")));
-    assert!(is_stale(unstage_hunk(&t.repo, F, 9, "@@ -1,1 +1,1 @@")));
+    assert!(is_stale(unstage_hunk(&t.repo, F, 0, &fake("@@ -1,1 +1,1 @@"))));
+    assert!(is_stale(unstage_hunk(&t.repo, F, 9, &fake("@@ -1,1 +1,1 @@"))));
     assert_eq!(t.index_blob(F), before);
 }
 
@@ -340,7 +399,7 @@ fn crlf_repo() -> TestRepo {
 fn hunk_ops_preserve_crlf_and_missing_newline() {
     // discard hunk 0
     let t = crlf_repo();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     assert_eq!(hs.len(), 2);
     discard_hunk(&t.repo, F, 0, &hs[0]).unwrap();
     assert_eq!(t.read(F), crlf_lines(&[(19, "S")]));
@@ -348,22 +407,22 @@ fn hunk_ops_preserve_crlf_and_missing_newline() {
 
     // discard hunk 1 (touches the line before the unterminated last line)
     let t = crlf_repo();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     discard_hunk(&t.repo, F, 1, &hs[1]).unwrap();
     assert_eq!(t.read(F), crlf_lines(&[(2, "B")]));
 
     // stage hunk 1, then hunk 0
     let t = crlf_repo();
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     stage_hunk(&t.repo, F, 1, &hs[1]).unwrap();
     assert_eq!(t.index_blob(F).unwrap(), crlf_lines(&[(19, "S")]));
     assert_eq!(t.read(F), crlf_lines(&[(2, "B"), (19, "S")]));
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     stage_hunk(&t.repo, F, 0, &hs[0]).unwrap();
     assert_eq!(t.index_blob(F).unwrap(), crlf_lines(&[(2, "B"), (19, "S")]));
 
     // unstage hunk 1 back out
-    let hs = headers(&t, DiffTarget::Staged, F);
+    let hs = hunks(&t, DiffTarget::Staged, F);
     unstage_hunk(&t.repo, F, 1, &hs[1]).unwrap();
     assert_eq!(t.index_blob(F).unwrap(), crlf_lines(&[(2, "B")]));
     assert_eq!(t.read(F), crlf_lines(&[(2, "B"), (19, "S")]));
@@ -373,7 +432,7 @@ fn hunk_ops_preserve_crlf_and_missing_newline() {
 fn stage_untracked_via_hunk_stages_whole_file() {
     let t = two_hunk_file();
     t.write("u.txt", b"one\ntwo\n");
-    let hs = headers(&t, DiffTarget::Unstaged, "u.txt");
+    let hs = hunks(&t, DiffTarget::Unstaged, "u.txt");
     assert_eq!(hs.len(), 1);
     stage_hunk(&t.repo, "u.txt", 0, &hs[0]).unwrap();
     assert_eq!(t.index_blob("u.txt").unwrap(), b"one\ntwo\n");
@@ -383,7 +442,7 @@ fn stage_untracked_via_hunk_stages_whole_file() {
 fn stage_untracked_via_hunk_checks_header() {
     let t = two_hunk_file();
     t.write("u.txt", b"one\ntwo\n");
-    assert!(is_stale(stage_hunk(&t.repo, "u.txt", 0, "@@ -0,0 +1,5 @@")));
+    assert!(is_stale(stage_hunk(&t.repo, "u.txt", 0, &fake("@@ -0,0 +1,5 @@"))));
     assert!(t.index_blob("u.txt").is_none());
 }
 
@@ -391,8 +450,8 @@ fn stage_untracked_via_hunk_checks_header() {
 fn discard_untracked_via_hunk_deletes_it() {
     let t = two_hunk_file();
     t.write("u.txt", b"one\ntwo\n");
-    let hs = headers(&t, DiffTarget::Unstaged, "u.txt");
-    assert!(is_stale(discard_hunk(&t.repo, "u.txt", 0, "@@ -0,0 +1,9 @@")));
+    let hs = hunks(&t, DiffTarget::Unstaged, "u.txt");
+    assert!(is_stale(discard_hunk(&t.repo, "u.txt", 0, &fake("@@ -0,0 +1,9 @@"))));
     assert!(t.exists("u.txt"));
     discard_hunk(&t.repo, "u.txt", 0, &hs[0]).unwrap();
     assert!(!t.exists("u.txt"));
@@ -402,7 +461,7 @@ fn discard_untracked_via_hunk_deletes_it() {
 fn stage_hunk_of_deleted_file_removes_it_from_index() {
     let t = two_hunk_file();
     t.remove(F);
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     stage_hunk(&t.repo, F, 0, &hs[0]).unwrap();
     assert!(t.index_blob(F).is_none());
 }
@@ -411,7 +470,7 @@ fn stage_hunk_of_deleted_file_removes_it_from_index() {
 fn discard_hunk_of_deleted_file_restores_it() {
     let t = two_hunk_file();
     t.remove(F);
-    let hs = headers(&t, DiffTarget::Unstaged, F);
+    let hs = hunks(&t, DiffTarget::Unstaged, F);
     discard_hunk(&t.repo, F, 0, &hs[0]).unwrap();
     assert_eq!(t.read(F), numbered());
 }
