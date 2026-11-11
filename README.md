@@ -28,10 +28,10 @@ The app is not notarized. After dragging it to Applications, the first launch is
 
 | Key | Action |
 | --- | --- |
-| Up / Down | Move selection in the file list (Changes tab) |
-| s | Stage the selected file |
-| u | Unstage the selected file |
-| Cmd+Backspace | Open the discard confirmation dialog for the selected file (never discards directly) |
+| Up / Down | Move selection in the file list (Changes tab) or the commit list (History tab) |
+| s | Stage the selected file (Changes tab) |
+| u | Unstage the selected file (Changes tab) |
+| Cmd+Backspace | Open the discard confirmation dialog for the selected file (Changes tab; never discards directly) |
 | Esc / Return | Cancel the open confirmation dialog |
 
 ## Performance

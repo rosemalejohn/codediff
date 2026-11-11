@@ -591,6 +591,28 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         }
     });
 
+    // Up/Down in History: newer (-1) or older (+1) commit; Changes untouched.
+    let s = send.clone();
+    let weak = window.as_weak();
+    window.on_move_commit_selection(move |delta| {
+        let Some(w) = weak.upgrade() else { return };
+        let ids: Vec<SharedString> = w.get_commits().iter().map(|r| r.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let current = (w.get_history_mode() == HIST_COMMIT)
+            .then(|| commit_index(&w, &w.get_history_commit()))
+            .flatten();
+        let next = match current {
+            Some(i) => (i as i64 + delta as i64).clamp(0, ids.len() as i64 - 1) as usize,
+            None if delta < 0 => ids.len() - 1,
+            None => 0,
+        };
+        if Some(next) != current {
+            select_commit(&w, &s, &ids[next]);
+        }
+    });
+
     let s = send.clone();
     let weak = window.as_weak();
     window.on_stage_file(move || {
@@ -1909,5 +1931,90 @@ mod tests {
         assert_eq!(w.get_range_base(), "");
         assert_eq!(w.get_commit_file(), "");
         assert!(!w.get_history_exhausted());
+    }
+
+    // ---- keyboard ----
+
+    use slint::platform::{Key, WindowEvent};
+
+    /// Presses and releases `text` on the window, with Command (Slint's
+    /// `control`) held when `cmd`.
+    fn press(w: &AppWindow, text: SharedString, cmd: bool) {
+        let win = w.window();
+        if cmd {
+            win.dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        }
+        win.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        win.dispatch_event(WindowEvent::KeyReleased { text });
+        if cmd {
+            win.dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+        }
+    }
+
+    /// A shown window with a repo open, an unstaged diff of a.rs and history.
+    fn keyboard_window() -> (AppWindow, Rc<RefCell<Vec<Command>>>) {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        w.show().unwrap();
+        w.set_has_repo(true);
+        apply(&w, status(&[], &[("a.rs", FileStatus::Modified)]));
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        apply(&w, Event::Diff(Some(text_view("a.rs", Some(ChangeSide::Unstaged), FileStatus::Modified))));
+        log.borrow_mut().clear();
+        (w, log)
+    }
+
+    #[test]
+    fn up_down_move_commit_selection_in_history() {
+        let (w, log) = keyboard_window();
+        w.set_active_tab(1);
+        log.borrow_mut().clear();
+        press(&w, Key::DownArrow.into(), false); // nothing selected: newest
+        assert_eq!(w.get_history_commit(), id("c3"));
+        press(&w, Key::DownArrow.into(), false);
+        assert_eq!(w.get_history_commit(), id("c2"));
+        assert!(row(&w, 1).selected);
+        press(&w, Key::DownArrow.into(), false);
+        press(&w, Key::DownArrow.into(), false); // at the end: stays
+        assert_eq!(w.get_history_commit(), id("c1"));
+        press(&w, Key::UpArrow.into(), false);
+        // Select(None) from the tab change aside, one commit select per move.
+        let commits: Vec<Oid> = log
+            .borrow()
+            .iter()
+            .filter_map(|c| match c {
+                Command::Select(Selection::Commit { id, path: None }) => Some(*id),
+                Command::Select(Selection::None) => None,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(commits, vec![oid("c3"), oid("c2"), oid("c1"), oid("c2")]);
+        // The Changes selection is untouched.
+        assert_eq!(w.get_selected_side(), -1);
+    }
+
+    #[test]
+    fn file_shortcuts_only_on_changes_tab() {
+        let (w, log) = keyboard_window();
+        w.set_active_tab(1);
+        log.borrow_mut().clear();
+        press(&w, "s".into(), false);
+        press(&w, "u".into(), false);
+        press(&w, Key::Backspace.into(), true);
+        // The diff pane still shows the unstaged a.rs until the controller answers.
+        assert!(
+            log.borrow().iter().all(|c| matches!(c, Command::Select(_))),
+            "{:?}",
+            log.borrow()
+        );
+        assert_eq!(w.get_discard_kind(), 0);
+
+        w.set_active_tab(0);
+        log.borrow_mut().clear();
+        press(&w, "s".into(), false);
+        assert!(log.borrow().iter().any(|c| matches!(c, Command::StageFile(p) if p == "a.rs")));
+        press(&w, Key::Backspace.into(), true);
+        assert_eq!(w.get_discard_kind(), 1);
     }
 }

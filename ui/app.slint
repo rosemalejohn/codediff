@@ -188,6 +188,8 @@ export component AppWindow inherits Window {
     callback dismiss-error();
     callback dark-changed(bool);
     callback move-selection(int);
+    // Up/Down in History: moves the commit selection.
+    callback move-commit-selection(int);
     callback stage-file();
     callback unstage-file();
     callback request-discard-file();
@@ -231,13 +233,18 @@ export component AppWindow inherits Window {
             if !root.has-repo || root.discard-kind != 0 {
                 return reject;
             }
-            if event.text == Key.UpArrow && root.active-tab == 0 {
-                root.move-selection(-1);
+            // Up/Down: files in Changes, commits in History.
+            if event.text == Key.UpArrow || event.text == Key.DownArrow {
+                if root.active-tab == 0 {
+                    root.move-selection(event.text == Key.UpArrow ? -1 : 1);
+                } else {
+                    root.move-commit-selection(event.text == Key.UpArrow ? -1 : 1);
+                }
                 return accept;
             }
-            if event.text == Key.DownArrow && root.active-tab == 0 {
-                root.move-selection(1);
-                return accept;
+            // File actions apply to the Changes tab only.
+            if root.active-tab != 0 {
+                return reject;
             }
             if event.text == Key.Backspace && event.modifiers.control {
                 root.request-discard-file();
