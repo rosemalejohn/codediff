@@ -114,3 +114,32 @@ pub fn hunk_fingerprint(h: &Hunk) -> u64 {
     }
     s.finish()
 }
+
+/// Content fingerprint of a whole file diff: status and body kind, plus every
+/// hunk fingerprint (Text), both sizes (Binary) or the line count (TooLarge).
+/// Same stability as `hunk_fingerprint`; used to check a file-level discard
+/// still targets what the user saw.
+pub fn file_fingerprint(f: &FileDiff) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut s = DefaultHasher::new();
+    (f.status as u8).hash(&mut s);
+    match &f.body {
+        DiffBody::Text(hunks) => {
+            0u8.hash(&mut s);
+            hunks.len().hash(&mut s);
+            for h in hunks {
+                hunk_fingerprint(h).hash(&mut s);
+            }
+        }
+        DiffBody::Binary { old_size, new_size } => {
+            1u8.hash(&mut s);
+            old_size.hash(&mut s);
+            new_size.hash(&mut s);
+        }
+        DiffBody::TooLarge { lines } => {
+            2u8.hash(&mut s);
+            lines.hash(&mut s);
+        }
+    }
+    s.finish()
+}

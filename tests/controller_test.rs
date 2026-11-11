@@ -550,3 +550,46 @@ fn drop_and_shutdown_end_worker() {
     h.ctl.send(Command::Refresh); // worker gone: must not panic or block
     drop(h); // join must not deadlock
 }
+
+#[test]
+fn stale_file_discard_is_rejected() {
+    let t = two_hunk_repo();
+    let h = Harness::new();
+    h.open(t.path());
+    // The dialog opens on this view and captures its fingerprint.
+    let v = select_unstaged(&h, "f.txt");
+    let fp = file_fingerprint(&v.file);
+
+    // An agent rewrites the file before the user confirms. No wait for the
+    // watcher: the check must not depend on a refresh having happened.
+    let edited = String::from_utf8(t.read("f.txt"))
+        .unwrap()
+        .replacen("10\n", "ten\n", 1);
+    t.write("f.txt", edited.as_bytes());
+    expect_stale(
+        &h,
+        Command::DiscardFile {
+            path: "f.txt".into(),
+            fingerprint: fp,
+        },
+    );
+    assert_eq!(t.read("f.txt"), edited.as_bytes(), "workdir untouched");
+}
+
+#[test]
+fn fresh_file_discard_discards() {
+    let t = two_hunk_repo();
+    let h = Harness::new();
+    h.open(t.path());
+    let v = select_unstaged(&h, "f.txt");
+    let m = h.mark();
+    h.ctl.send(Command::DiscardFile {
+        path: "f.txt".into(),
+        fingerprint: file_fingerprint(&v.file),
+    });
+    h.wait_for(m, |e| status_has(e, &[], &[]));
+    assert_eq!(t.read("f.txt"), numbered());
+    assert!(!h.events.lock().unwrap()[m..]
+        .iter()
+        .any(|e| matches!(e, Event::Error(_))));
+}

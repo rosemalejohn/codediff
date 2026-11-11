@@ -3,7 +3,7 @@ use crate::controller::{Command, DiffView, Event, RangeInfo, Selection};
 use crate::history::relative_time;
 use crate::highlight::{StyledCell, StyledRow};
 use crate::model::{
-    hunk_fingerprint, ChangeSide, CommitInfo, DiffBody, FileEntry, FileStatus, LineKind,
+    file_fingerprint, hunk_fingerprint, ChangeSide, CommitInfo, DiffBody, FileEntry, FileStatus, LineKind,
 };
 use crate::ui::{AppWindow, CellData, CommitRow, FileRow, RowData, SegData};
 use git2::Oid;
@@ -35,7 +35,7 @@ const HIST_NONE: i32 = 0;
 const HIST_COMMIT: i32 = 1;
 const HIST_RANGE: i32 = 2;
 
-const STALE_HUNK: &str = "File changed, refreshed. Try again.";
+const STALE_MSG: &str = "File changed, refreshed. Try again.";
 
 /// Applies one controller event to the window. Must run on the UI thread.
 pub fn apply(window: &AppWindow, ev: Event) {
@@ -317,6 +317,7 @@ fn clear_diff(window: &AppWindow) {
     window.set_diff_deletions(0);
     window.set_diff_untracked(false);
     window.set_hunk_actions(false);
+    window.set_diff_fingerprint(SharedString::new());
     window.set_diff_scroll_y(0.0);
 }
 
@@ -376,6 +377,7 @@ fn apply_diff(window: &AppWindow, view: DiffView) {
     window.set_diff_additions(file.additions as i32);
     window.set_diff_deletions(file.deletions as i32);
     window.set_diff_untracked(file.status == FileStatus::Untracked);
+    window.set_diff_fingerprint(format!("{:x}", file_fingerprint(file)).into());
     window.set_hunk_actions(match view.side {
         Some(ChangeSide::Unstaged) => true,
         // Hunk ops on a staged rename always fail as stale; file-level only.
@@ -468,7 +470,7 @@ fn parse_fingerprint(s: &str) -> Option<u64> {
 fn hunk_args(w: &AppWindow, index: i32, fingerprint: &str) -> Option<(usize, u64)> {
     let parsed = usize::try_from(index).ok().zip(parse_fingerprint(fingerprint));
     if parsed.is_none() {
-        w.set_error_text(STALE_HUNK.into());
+        w.set_error_text(STALE_MSG.into());
     }
     parsed
 }
@@ -572,6 +574,12 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     window.on_request_discard_file(move || {
         let Some(w) = weak.upgrade() else { return };
         let Some(path) = shown_path(&w, SIDE_UNSTAGED) else { return };
+        // Captured now, from the diff the user is looking at.
+        let fingerprint = w.get_diff_fingerprint();
+        if parse_fingerprint(&fingerprint).is_none() {
+            w.set_error_text(STALE_MSG.into());
+            return;
+        }
         let body = if w.get_diff_untracked() {
             format!("Delete untracked file {path}? This cannot be undone.")
         } else {
@@ -580,6 +588,7 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         clear_discard(&w);
         w.set_discard_path(path.into());
         w.set_discard_body(body.into());
+        w.set_discard_fingerprint(fingerprint);
         w.set_discard_kind(DISCARD_FILE);
     });
 
@@ -643,7 +652,10 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         let fingerprint = w.get_discard_fingerprint();
         clear_discard(&w);
         match kind {
-            DISCARD_FILE => s(Command::DiscardFile(path)),
+            DISCARD_FILE => match parse_fingerprint(&fingerprint) {
+                Some(fingerprint) => s(Command::DiscardFile { path, fingerprint }),
+                None => w.set_error_text(STALE_MSG.into()),
+            },
             DISCARD_HUNK => {
                 if let Some((hunk_index, fingerprint)) = hunk_args(&w, index, &fingerprint) {
                     s(Command::DiscardHunk { path, hunk_index, header, fingerprint });
@@ -1256,12 +1268,36 @@ mod tests {
             w.get_discard_body(),
             "Discard all unstaged changes in a.rs? This cannot be undone."
         );
+        // The view changes while the dialog is open: the captured fingerprint is sent.
+        let shown = text_view("a.rs", Some(ChangeSide::Unstaged), FileStatus::Modified);
+        let fp = crate::model::file_fingerprint(&shown.file);
+        let mut changed = shown.clone();
+        changed.file.status = FileStatus::Added;
+        apply(&w, Event::Diff(Some(changed)));
         w.invoke_confirm_discard();
-        assert!(matches!(log.borrow().as_slice(), [Command::DiscardFile(p)] if p == "a.rs"));
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::DiscardFile { path, fingerprint }] if path == "a.rs" && *fingerprint == fp
+        ));
         assert_eq!(w.get_discard_kind(), 0);
         // A second confirm without a new request sends nothing.
         w.invoke_confirm_discard();
         assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn discard_file_without_fingerprint_sends_nothing() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply(&w, Event::Diff(Some(text_view("a.rs", Some(ChangeSide::Unstaged), FileStatus::Modified))));
+        w.set_diff_fingerprint(SharedString::new());
+        log.borrow_mut().clear();
+        w.invoke_request_discard_file();
+        assert_eq!(w.get_discard_kind(), 0);
+        assert_eq!(w.get_error_text(), "File changed, refreshed. Try again.");
+        w.invoke_confirm_discard();
+        assert!(log.borrow().is_empty());
     }
 
     #[test]

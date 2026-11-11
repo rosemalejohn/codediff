@@ -158,6 +158,8 @@ export component AppWindow inherits Window {
     in-out property <int> discard-hunk-index;
     in-out property <string> discard-header;
     in-out property <string> discard-fingerprint;
+    // Lowercase hex `file_fingerprint` of the shown diff; empty when none.
+    in-out property <string> diff-fingerprint;
 
     // History tab.
     in-out property <[CommitRow]> commits;

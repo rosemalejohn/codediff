@@ -3,7 +3,7 @@ use crate::diff::{diff_stats, file_diff, files_in_target};
 use crate::highlight::{Highlighter, StyledRow};
 use crate::history::list_commits;
 use crate::model::{
-    hunk_fingerprint, ChangeSide, CommitInfo, DiffBody, DiffTarget, FileDiff, FileEntry, Hunk,
+    file_fingerprint, hunk_fingerprint, ChangeSide, CommitInfo, DiffBody, DiffTarget, FileDiff, FileEntry, Hunk,
     StatusLists,
 };
 use crate::recent::RecentRepos;
@@ -48,7 +48,11 @@ pub enum Command {
     LoadMoreHistory,
     StageFile(String),
     UnstageFile(String),
-    DiscardFile(String),
+    /// `fingerprint` is `file_fingerprint` of the unstaged diff the user saw.
+    DiscardFile {
+        path: String,
+        fingerprint: u64,
+    },
     StageHunk {
         path: String,
         hunk_index: usize,
@@ -258,7 +262,7 @@ impl Worker {
             Command::LoadMoreHistory => self.load_more_history(),
             Command::StageFile(p) => self.mutate(|r| stage::stage_file(r, &p)),
             Command::UnstageFile(p) => self.mutate(|r| stage::unstage_file(r, &p)),
-            Command::DiscardFile(p) => self.mutate(|r| stage::discard_file(r, &p)),
+            Command::DiscardFile { path, fingerprint } => self.discard_file(path, fingerprint),
             Command::StageHunk {
                 path,
                 hunk_index,
@@ -557,6 +561,24 @@ impl Worker {
             && h.header == req.header
             && hunk_fingerprint(h) == req.fingerprint;
         (side_ok && same).then(|| h.clone())
+    }
+
+    /// Discards the file only when its unstaged diff, recomputed now, still has
+    /// the fingerprint of the diff the user confirmed.
+    fn discard_file(&mut self, path: String, fingerprint: u64) {
+        let Some(o) = &self.open else { return };
+        let current = match file_diff(&o.repo, &DiffTarget::Unstaged, &path, self.force_full) {
+            Ok(f) => f,
+            Err(e) => {
+                self.emit(Event::Error(e.to_string()));
+                return self.refresh();
+            }
+        };
+        if current.as_ref().map(file_fingerprint) != Some(fingerprint) {
+            self.emit(Event::Error(CoreError::Stale.to_string()));
+            return self.refresh();
+        }
+        self.mutate(|r| stage::discard_file(r, &path));
     }
 
     fn hunk(&mut self, op: HunkOp, req: HunkReq) {
