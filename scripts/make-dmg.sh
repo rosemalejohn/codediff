@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 NAME=CodeDiff
 ID=com.codediff.app
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/{p;q}' Cargo.toml)
+VERSION=$(sed -n -e '/^version = /{s/^version = "\(.*\)"/\1/' -e p -e q -e '}' Cargo.toml)
 DIST=dist
 APP="$DIST/$NAME.app"
 
