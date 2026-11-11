@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 fn main() -> Result<(), slint::PlatformError> {
+    let process_start = std::time::Instant::now();
     let window = AppWindow::new()?;
 
     let recent_file = RecentRepos::default_file();
@@ -33,6 +34,13 @@ fn main() -> Result<(), slint::PlatformError> {
         .or_else(|| recent.paths.first().cloned());
     if let Some(path) = initial {
         controller.send(Command::OpenRepo(path));
+    }
+
+    if std::env::var_os("CODEDIFF_STARTUP_TRACE").is_some() {
+        window.show()?;
+        slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+            eprintln!("startup: {} ms to first frame", process_start.elapsed().as_millis());
+        });
     }
 
     window.run()
