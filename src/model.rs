@@ -89,3 +89,14 @@ pub struct FileDiff {
     pub additions: u32,
     pub deletions: u32,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub id: git2::Oid,
+    /// First 7 characters of the id.
+    pub short_id: String,
+    pub summary: String,
+    pub author: String,
+    /// Unix seconds.
+    pub time: i64,
+}
