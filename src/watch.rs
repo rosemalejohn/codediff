@@ -1,26 +1,59 @@
-//! Debounced filesystem watcher for a repository working tree.
+//! Debounced filesystem watcher for a repository working tree and its Git dirs.
 use crate::Result;
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-/// Whether a changed path should trigger a refresh.
-/// `is_ignored` receives the path relative to `root`.
-pub fn is_relevant(root: &Path, path: &Path, is_ignored: &dyn Fn(&Path) -> bool) -> bool {
+/// Whether `inner` (relative to a Git dir) is state that changes what we show:
+/// the index, HEAD, packed-refs or anything under refs/.
+fn is_git_state(inner: &Path) -> bool {
+    let mut parts = inner.components();
+    let first = parts.next().and_then(|c| c.as_os_str().to_str());
+    match first {
+        Some("index" | "HEAD" | "packed-refs") => parts.next().is_none(),
+        Some("refs") => true,
+        _ => false,
+    }
+}
+
+/// Whether a changed path should trigger a refresh, for a working tree at
+/// `root` whose Git dirs are `git_dirs` (the gitdir and, for a linked worktree,
+/// the common dir; either may live outside `root`). Inside a Git dir only
+/// index, HEAD, packed-refs and refs/** count. `is_ignored` receives the path
+/// relative to `root`.
+pub fn is_relevant_in(
+    root: &Path,
+    git_dirs: &[PathBuf],
+    path: &Path,
+    is_ignored: &dyn Fn(&Path) -> bool,
+) -> bool {
+    let mut in_git_dir = false;
+    for g in git_dirs {
+        if let Ok(inner) = path.strip_prefix(g) {
+            if is_git_state(inner) {
+                return true;
+            }
+            in_git_dir = true;
+        }
+    }
+    if in_git_dir {
+        return false;
+    }
     let Ok(rel) = path.strip_prefix(root) else {
         return false;
     };
-    if let Ok(inner) = rel.strip_prefix(".git") {
-        let mut parts = inner.components();
-        let first = parts.next().and_then(|c| c.as_os_str().to_str());
-        return match first {
-            Some("index" | "HEAD" | "packed-refs") => parts.next().is_none(),
-            Some("refs") => true,
-            _ => false,
-        };
+    // `.git` itself (a file in a linked worktree) or anything below it that
+    // is not one of the listed Git dirs.
+    if rel.components().next() == Some(Component::Normal(".git".as_ref())) {
+        return false;
     }
     !is_ignored(rel)
+}
+
+/// `is_relevant_in` for an ordinary repo whose Git dir is `root/.git`.
+pub fn is_relevant(root: &Path, path: &Path, is_ignored: &dyn Fn(&Path) -> bool) -> bool {
+    is_relevant_in(root, &[root.join(".git")], path, is_ignored)
 }
 
 /// Watches a repo and calls `on_change` once per relevant debounced batch.
@@ -32,8 +65,32 @@ pub struct RepoWatcher {
 impl RepoWatcher {
     pub fn start(root: PathBuf, on_change: impl Fn() + Send + 'static) -> Result<RepoWatcher> {
         let root = root.canonicalize()?;
-        let watch_root = root.clone();
         let repo = git2::Repository::open(&root).ok();
+        // Gitdir and common dir; in a linked worktree (or any repo whose .git
+        // is a file) they live outside the working tree.
+        let mut git_dirs: Vec<PathBuf> = vec![root.join(".git")];
+        if let Some(r) = &repo {
+            for d in [r.path(), r.commondir()] {
+                if let Ok(c) = d.canonicalize() {
+                    if !git_dirs.contains(&c) {
+                        git_dirs.push(c);
+                    }
+                }
+            }
+        }
+        // Extra watch roots: Git dirs outside `root`, minus ones nested in another.
+        let outside: Vec<PathBuf> = git_dirs
+            .iter()
+            .filter(|d| !d.starts_with(&root))
+            .cloned()
+            .collect();
+        let extra: Vec<PathBuf> = outside
+            .iter()
+            .filter(|d| !outside.iter().any(|o| o != *d && d.starts_with(o)))
+            .cloned()
+            .collect();
+
+        let watch_root = root.clone();
         let mut debouncer = new_debouncer(
             Duration::from_millis(150),
             None,
@@ -47,16 +104,18 @@ impl RepoWatcher {
                 let relevant = events
                     .iter()
                     .flat_map(|e| e.event.paths.iter())
-                    .any(|p| is_relevant(&root, p, &ignored));
+                    .any(|p| is_relevant_in(&root, &git_dirs, p, &ignored));
                 if relevant {
                     on_change();
                 }
             },
         )
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-        debouncer
-            .watch(&watch_root, RecursiveMode::Recursive)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        for dir in std::iter::once(&watch_root).chain(&extra) {
+            debouncer
+                .watch(dir, RecursiveMode::Recursive)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
         Ok(RepoWatcher { _debouncer: debouncer })
     }
 }

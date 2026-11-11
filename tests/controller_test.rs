@@ -673,3 +673,35 @@ fn fixed_range_does_not_follow_head() {
         .iter()
         .any(|e| matches!(e, Event::Range(_))));
 }
+
+#[test]
+fn linked_worktree_index_and_commit_trigger_refresh() {
+    let t = TestRepo::new();
+    t.write("a.txt", b"a\n");
+    t.stage("a.txt");
+    t.commit("first");
+    let parent = tempfile::tempdir().unwrap();
+    let wt_path = parent.path().join("wt");
+    t.repo.worktree("wt", &wt_path, None).unwrap();
+    let wt = git2::Repository::open(&wt_path).unwrap();
+    std::fs::write(wt_path.join("new.txt"), b"hello\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let h = Harness::new();
+    let m = h.open(&wt_path);
+    h.wait_for(0, |e| status_has(e, &[], &["new.txt"]));
+
+    // Only Git state changes from here on, no workdir writes.
+    let mut idx = wt.index().unwrap();
+    idx.add_path(std::path::Path::new("new.txt")).unwrap();
+    idx.write().unwrap();
+    let m = h.wait_for(m, |e| status_has(e, &["new.txt"], &[])).0;
+
+    let tree = wt.find_tree(idx.write_tree().unwrap()).unwrap();
+    let sig = wt.signature().unwrap();
+    let parent_commit = wt.head().unwrap().peel_to_commit().unwrap();
+    let c2 = wt
+        .commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&parent_commit])
+        .unwrap();
+    h.wait_for(m, |e| matches!(e, Event::History { new_ids, .. } if new_ids == &vec![c2]));
+}

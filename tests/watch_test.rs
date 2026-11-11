@@ -1,5 +1,5 @@
 mod common;
-use codediff::watch::{is_relevant, RepoWatcher};
+use codediff::watch::{is_relevant, is_relevant_in, RepoWatcher};
 use common::TestRepo;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +18,35 @@ fn git_internal_noise_ignored() {
     }
     for p in ["/r/.git/index", "/r/.git/HEAD", "/r/.git/refs/heads/main", "/r/.git/packed-refs"] {
         assert!(is_relevant(root, Path::new(p), &never), "{p}");
+    }
+}
+
+#[test]
+fn linked_worktree_git_dirs_are_relevant() {
+    // Workdir /wt (its .git is a file), gitdir /m/.git/worktrees/wt, commondir /m/.git.
+    let root = Path::new("/wt");
+    let dirs = [
+        Path::new("/m/.git/worktrees/wt").to_path_buf(),
+        Path::new("/m/.git").to_path_buf(),
+    ];
+    for p in [
+        "/m/.git/worktrees/wt/index",
+        "/m/.git/worktrees/wt/HEAD",
+        "/m/.git/refs/heads/wt",
+        "/m/.git/packed-refs",
+        "/wt/src/a.rs",
+    ] {
+        assert!(is_relevant_in(root, &dirs, Path::new(p), &never), "{p}");
+    }
+    for p in [
+        "/m/.git/worktrees/wt/index.lock",
+        "/m/.git/worktrees/wt/logs/HEAD",
+        "/m/.git/objects/ab/cd",
+        "/m/.git/worktrees/other/HEAD",
+        "/wt/.git",
+        "/m/src/a.rs",
+    ] {
+        assert!(!is_relevant_in(root, &dirs, Path::new(p), &never), "{p}");
     }
 }
 
