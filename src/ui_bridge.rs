@@ -1,12 +1,17 @@
 //! Maps controller Events onto `AppWindow` properties and UI callbacks onto Commands.
-use crate::controller::{Command, DiffView, Event, Selection};
+use crate::controller::{Command, DiffView, Event, RangeInfo, Selection};
+use crate::history::relative_time;
 use crate::highlight::{StyledCell, StyledRow};
-use crate::model::{hunk_fingerprint, ChangeSide, DiffBody, FileEntry, FileStatus, LineKind};
-use crate::ui::{AppWindow, CellData, FileRow, RowData, SegData};
+use crate::model::{
+    hunk_fingerprint, ChangeSide, CommitInfo, DiffBody, FileEntry, FileStatus, LineKind,
+};
+use crate::ui::{AppWindow, CellData, CommitRow, FileRow, RowData, SegData};
+use git2::Oid;
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SIDE_STAGED: i32 = 0;
 const SIDE_UNSTAGED: i32 = 1;
@@ -26,10 +31,23 @@ const DISCARD_HUNK: i32 = 2;
 const LINE_HEIGHT: f32 = 18.0;
 const HEADER_HEIGHT: f32 = 30.0;
 
+const HIST_NONE: i32 = 0;
+const HIST_COMMIT: i32 = 1;
+const HIST_RANGE: i32 = 2;
+
 const STALE_HUNK: &str = "File changed, refreshed. Try again.";
 
 /// Applies one controller event to the window. Must run on the UI thread.
 pub fn apply(window: &AppWindow, ev: Event) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    apply_at(window, ev, now);
+}
+
+/// `apply` with an explicit clock (unix seconds) for relative commit times.
+fn apply_at(window: &AppWindow, ev: Event, now: i64) {
     match ev {
         Event::RepoOpened { name, recent, .. } => {
             window.set_repo_name(name.into());
@@ -45,6 +63,12 @@ pub fn apply(window: &AppWindow, ev: Event) {
             window.set_left_title(SharedString::new());
             window.set_right_title(SharedString::new());
             clear_discard(window);
+            window.set_commits(ModelRc::new(VecModel::<CommitRow>::default()));
+            window.set_history_loading(false);
+            window.set_history_exhausted(false);
+            set_history_selection(window, HIST_NONE, "", "", "");
+            window.set_range_banner(SharedString::new());
+            clear_commit_files(window);
         }
         Event::Status(lists) => {
             let side = window.get_selected_side();
@@ -70,11 +94,216 @@ pub fn apply(window: &AppWindow, ev: Event) {
             mark_selection(window);
         }
         Event::Error(msg) => window.set_error_text(msg.into()),
-        Event::Diff(Some(view)) => apply_diff(window, view),
+        Event::Diff(Some(view)) => {
+            let history = view.side.is_none();
+            let path = view.file.path.clone();
+            apply_diff(window, view);
+            if history {
+                window.set_commit_file(path.into());
+                mark_files(window);
+            }
+        }
         Event::Diff(None) => clear_diff(window),
-        // History, files and range views arrive in Task 12.
-        Event::History { .. } | Event::Files(_) | Event::Range(_) => {}
+        Event::History { commits, append, new_ids } => {
+            apply_history(window, &commits, append, &new_ids, now)
+        }
+        Event::Files(files) => {
+            let keep = window.get_commit_file();
+            let path = if files.iter().any(|f| f.path == keep.as_str()) {
+                keep
+            } else {
+                files.first().map(|f| f.path.as_str().into()).unwrap_or_default()
+            };
+            window.set_commit_files(rows(&files, NO_SIDE));
+            window.set_commit_file(path);
+            mark_files(window);
+        }
+        Event::Range(Some(info)) => {
+            if window.get_history_mode() == HIST_RANGE {
+                // The head moves when new commits land on a range ending at HEAD.
+                window.set_range_base(info.base.to_string().into());
+                window.set_range_head(info.head.to_string().into());
+                mark_commits(window);
+            }
+            window.set_range_banner(range_banner(&info).into());
+        }
+        // Also emitted when another tab takes over the controller selection;
+        // keep the banner while the History tab still holds a range.
+        Event::Range(None) => {
+            if window.get_history_mode() != HIST_RANGE {
+                window.set_range_banner(SharedString::new());
+            }
+        }
     }
+}
+
+fn range_banner(info: &RangeInfo) -> String {
+    let noun = if info.commit_count == 1 { "commit" } else { "commits" };
+    format!(
+        "Reviewing {} {noun} since {}  +{} -{}",
+        info.commit_count,
+        short(&info.base.to_string()),
+        info.additions,
+        info.deletions
+    )
+}
+
+fn short(id: &str) -> &str {
+    id.get(..7).unwrap_or(id)
+}
+
+fn apply_history(window: &AppWindow, commits: &[CommitInfo], append: bool, new_ids: &[Oid], now: i64) {
+    let old = window.get_commits();
+    let mut out: Vec<CommitRow> = Vec::new();
+    // Marks stay until the row is clicked, across refreshes.
+    let mut marked: HashSet<SharedString> = new_ids.iter().map(|i| i.to_string().into()).collect();
+    if append {
+        out.extend(old.iter());
+    } else {
+        marked.extend(old.iter().filter(|r| r.is_new).map(|r| r.id));
+    }
+    out.extend(commits.iter().map(|c| {
+        let id: SharedString = c.id.to_string().into();
+        CommitRow {
+            is_new: marked.contains(&id),
+            id,
+            short_id: c.short_id.as_str().into(),
+            summary: c.summary.as_str().into(),
+            author: c.author.as_str().into(),
+            when: relative_time(now, c.time).into(),
+            selected: false,
+            in_range: false,
+        }
+    }));
+    window.set_commits(ModelRc::new(VecModel::from(out)));
+    window.set_history_loading(false);
+    if append && commits.is_empty() {
+        window.set_history_exhausted(true);
+    }
+    mark_commits(window);
+}
+
+/// Sets each commit row's `selected` / `in-range` flags from the history selection.
+fn mark_commits(window: &AppWindow) {
+    let model = window.get_commits();
+    let mode = window.get_history_mode();
+    let selected = window.get_history_commit();
+    let (base, head) = (window.get_range_base(), window.get_range_head());
+    let ids: Vec<SharedString> = model.iter().map(|r| r.id).collect();
+    // Newest first: rows from head (inclusive) down to base (exclusive).
+    let range = if mode == HIST_RANGE {
+        ids.iter().position(|i| *i == head).map(|h| {
+            let b = ids.iter().position(|i| *i == base).unwrap_or(ids.len());
+            h..b.max(h)
+        })
+    } else {
+        None
+    };
+    for (i, id) in ids.iter().enumerate() {
+        let Some(mut row) = model.row_data(i) else { continue };
+        let want_sel = mode == HIST_COMMIT && *id == selected;
+        let want_range = range.as_ref().is_some_and(|r| r.contains(&i));
+        if row.selected != want_sel || row.in_range != want_range {
+            row.selected = want_sel;
+            row.in_range = want_range;
+            model.set_row_data(i, row);
+        }
+    }
+}
+
+/// Sets each file-strip chip's `selected` flag from `commit-file`.
+fn mark_files(window: &AppWindow) {
+    let model = window.get_commit_files();
+    let path = window.get_commit_file();
+    for i in 0..model.row_count() {
+        let Some(mut row) = model.row_data(i) else { continue };
+        let want = row.path == path;
+        if row.selected != want {
+            row.selected = want;
+            model.set_row_data(i, row);
+        }
+    }
+}
+
+fn clear_commit_files(window: &AppWindow) {
+    window.set_commit_files(rows(&[], NO_SIDE));
+    window.set_commit_file(SharedString::new());
+}
+
+fn set_history_selection(w: &AppWindow, mode: i32, commit: &str, base: &str, head: &str) {
+    w.set_history_mode(mode);
+    w.set_history_commit(commit.into());
+    w.set_range_base(base.into());
+    w.set_range_head(head.into());
+    w.set_commit_file(SharedString::new());
+    mark_commits(w);
+}
+
+/// Full 40-char hex id from the UI; anything else is ignored.
+fn parse_oid(s: &str) -> Option<Oid> {
+    (s.len() == 40).then(|| Oid::from_str(s).ok()).flatten()
+}
+
+/// Clears the "new" marker of a clicked row.
+fn clear_new(w: &AppWindow, id: &str) {
+    let model = w.get_commits();
+    for i in 0..model.row_count() {
+        let Some(mut row) = model.row_data(i) else { continue };
+        if row.id == id && row.is_new {
+            row.is_new = false;
+            model.set_row_data(i, row);
+        }
+    }
+}
+
+/// Row index of a commit id in the loaded list (0 is newest).
+fn commit_index(w: &AppWindow, id: &str) -> Option<usize> {
+    w.get_commits().iter().position(|r| r.id == id)
+}
+
+fn select_commit(w: &AppWindow, send: &impl Fn(Command), id: &str) {
+    let Some(oid) = parse_oid(id) else { return };
+    clear_new(w, id);
+    set_history_selection(w, HIST_COMMIT, id, "", "");
+    w.set_range_banner(SharedString::new());
+    w.set_diff_scroll_y(0.0);
+    send(Command::Select(Selection::Commit { id: oid, path: None }));
+}
+
+fn select_range(w: &AppWindow, send: &impl Fn(Command), base: &str, head: &str) {
+    let (Some(b), Some(h)) = (parse_oid(base), parse_oid(head)) else { return };
+    set_history_selection(w, HIST_RANGE, "", base, head);
+    w.set_diff_scroll_y(0.0);
+    send(Command::Select(Selection::Range { base: b, head: h, path: None }));
+}
+
+/// The History tab's current selection, including the selected strip file.
+fn history_selection(w: &AppWindow) -> Option<Selection> {
+    let file = w.get_commit_file();
+    let path = (!file.is_empty()).then(|| file.to_string());
+    match w.get_history_mode() {
+        HIST_COMMIT => Some(Selection::Commit { id: parse_oid(&w.get_history_commit())?, path }),
+        HIST_RANGE => Some(Selection::Range {
+            base: parse_oid(&w.get_range_base())?,
+            head: parse_oid(&w.get_range_head())?,
+            path,
+        }),
+        _ => None,
+    }
+}
+
+/// Column titles for a History diff: "Parent" | commit, or base | head.
+fn history_titles(window: &AppWindow) {
+    let (left, right) = match window.get_history_mode() {
+        HIST_COMMIT => ("Parent".to_string(), short(&window.get_history_commit()).to_string()),
+        HIST_RANGE => (
+            short(&window.get_range_base()).to_string(),
+            short(&window.get_range_head()).to_string(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    window.set_left_title(left.into());
+    window.set_right_title(right.into());
 }
 
 /// Empties the diff pane (column titles are left to the caller).
@@ -136,10 +365,8 @@ fn apply_diff(window: &AppWindow, view: DiffView) {
             window.set_left_title("HEAD".into());
             window.set_right_title("Staged".into());
         }
-        // History titles ("Parent" | commit short id, base | head short id) need
-        // commit ids this event does not carry; Task 12 sets them from its
-        // History/Range state. Leave whatever it set.
-        None => {}
+        // History: the event carries no commit ids; use the UI's history selection.
+        None => history_titles(window),
     }
 
     window.set_diff_path(file.path.as_str().into());
@@ -441,6 +668,94 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         if let Some(w) = weak.upgrade() {
             w.set_error_text(SharedString::new());
         }
+    });
+
+    let s = send.clone();
+    let weak = window.as_weak();
+    window.on_select_commit(move |id| {
+        let Some(w) = weak.upgrade() else { return };
+        select_commit(&w, &s, &id);
+    });
+
+    // Shift-click with one commit selected: older of the two is the base.
+    let s = send.clone();
+    let weak = window.as_weak();
+    window.on_shift_select_commit(move |id| {
+        let Some(w) = weak.upgrade() else { return };
+        let current = w.get_history_commit();
+        if w.get_history_mode() != HIST_COMMIT || current == id {
+            return select_commit(&w, &s, &id);
+        }
+        let (Some(a), Some(b)) = (commit_index(&w, &current), commit_index(&w, &id)) else {
+            return select_commit(&w, &s, &id);
+        };
+        clear_new(&w, &id);
+        let (base, head) = if a > b { (current, id) } else { (id, current) };
+        select_range(&w, &s, &base, &head);
+    });
+
+    // "Review since here": base exclusive, up to HEAD (the newest loaded row).
+    let s = send.clone();
+    let weak = window.as_weak();
+    window.on_review_since(move |id| {
+        let Some(w) = weak.upgrade() else { return };
+        let Some(head) = w.get_commits().row_data(0).map(|r| r.id) else { return };
+        clear_new(&w, &id);
+        select_range(&w, &s, &id, &head);
+    });
+
+    let s = send.clone();
+    let weak = window.as_weak();
+    window.on_clear_range(move || {
+        let Some(w) = weak.upgrade() else { return };
+        set_history_selection(&w, HIST_NONE, "", "", "");
+        w.set_range_banner(SharedString::new());
+        clear_commit_files(&w);
+        s(Command::Select(Selection::None));
+    });
+
+    let s = send.clone();
+    let weak = window.as_weak();
+    window.on_select_commit_file(move |path| {
+        let Some(w) = weak.upgrade() else { return };
+        w.set_commit_file(path);
+        mark_files(&w);
+        w.set_diff_scroll_y(0.0);
+        if let Some(sel) = history_selection(&w) {
+            s(Command::Select(sel));
+        }
+    });
+
+    let s = send.clone();
+    let weak = window.as_weak();
+    window.on_history_scrolled_to_end(move || {
+        let Some(w) = weak.upgrade() else { return };
+        if w.get_history_loading() || w.get_history_exhausted() || w.get_commits().row_count() == 0 {
+            return;
+        }
+        w.set_history_loading(true);
+        s(Command::LoadMoreHistory);
+    });
+
+    // Re-show the newly active tab's own selection (the diff pane is shared).
+    let s = send.clone();
+    let weak = window.as_weak();
+    window.on_tab_changed(move |tab| {
+        let Some(w) = weak.upgrade() else { return };
+        w.set_diff_scroll_y(0.0);
+        let sel = if tab == 0 {
+            let side = w.get_selected_side();
+            let path = w.get_selected_path();
+            if side == NO_SIDE || path.is_empty() {
+                None
+            } else {
+                let side = if side == SIDE_STAGED { ChangeSide::Staged } else { ChangeSide::Unstaged };
+                Some(Selection::Change { side, path: path.into() })
+            }
+        } else {
+            history_selection(&w)
+        };
+        s(Command::Select(sel.unwrap_or(Selection::None)));
     });
 
     let s = send.clone();
@@ -1051,5 +1366,382 @@ mod tests {
         let w = window();
         set_recent(&w, &[PathBuf::from("/a"), PathBuf::from("/b")]);
         assert_eq!(w.get_recent().row_count(), 2);
+    }
+
+    // ---- history ----
+
+    use crate::controller::RangeInfo;
+    use crate::model::CommitInfo;
+    use git2::Oid;
+
+    const NOW: i64 = 1_800_000_000;
+
+    /// A deterministic oid whose hex starts with `prefix` (hex chars only).
+    fn oid(prefix: &str) -> Oid {
+        Oid::from_str(&format!("{prefix:0<40}")).unwrap()
+    }
+
+    fn commit(prefix: &str, summary: &str, age_secs: i64) -> CommitInfo {
+        let id = oid(prefix);
+        CommitInfo {
+            id,
+            short_id: id.to_string()[..7].to_string(),
+            summary: summary.into(),
+            author: "Ana".into(),
+            time: NOW - age_secs,
+        }
+    }
+
+    /// Newest first: c3 (HEAD), c2, c1.
+    fn three() -> Vec<CommitInfo> {
+        vec![commit("c3", "third", 30), commit("c2", "second", 7200), commit("c1", "first", 3 * 86400)]
+    }
+
+    fn history(commits: Vec<CommitInfo>, append: bool, new_ids: Vec<Oid>) -> Event {
+        Event::History { commits, append, new_ids }
+    }
+
+    fn row(w: &AppWindow, i: usize) -> crate::ui::CommitRow {
+        w.get_commits().row_data(i).unwrap()
+    }
+
+    fn id(prefix: &str) -> SharedString {
+        oid(prefix).to_string().into()
+    }
+
+    #[test]
+    fn history_event_fills_rows() {
+        let w = window();
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        assert_eq!(w.get_commits().row_count(), 3);
+        let r = row(&w, 1);
+        assert_eq!(r.id, id("c2"));
+        assert_eq!(r.short_id, "c200000");
+        assert_eq!(r.summary, "second");
+        assert_eq!(r.author, "Ana");
+        assert_eq!(r.when, "2h ago");
+        assert!(!r.is_new && !r.selected && !r.in_range);
+        assert_eq!(row(&w, 0).when, "just now");
+    }
+
+    #[test]
+    fn history_event_marks_new() {
+        let w = window();
+        apply_at(&w, history(three(), false, vec![oid("c3")]), NOW);
+        assert!(row(&w, 0).is_new);
+        assert!(!row(&w, 1).is_new);
+    }
+
+    #[test]
+    fn new_marks_survive_refresh_until_clicked() {
+        let w = window();
+        let (_log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three()[1..].to_vec(), false, vec![]), NOW);
+        apply_at(&w, history(three(), false, vec![oid("c3")]), NOW);
+        let mut four = vec![commit("c4", "fourth", 5)];
+        four.extend(three());
+        // A later refresh with only c4 new must keep c3's mark.
+        apply_at(&w, history(four.clone(), false, vec![oid("c4")]), NOW);
+        assert!(row(&w, 0).is_new);
+        assert!(row(&w, 1).is_new);
+        w.invoke_select_commit(id("c3"));
+        assert!(!row(&w, 1).is_new);
+        assert!(row(&w, 0).is_new);
+        apply_at(&w, history(four, false, vec![]), NOW);
+        assert!(!row(&w, 1).is_new);
+        assert!(row(&w, 0).is_new);
+    }
+
+    #[test]
+    fn history_append_extends_list() {
+        let w = window();
+        apply_at(&w, history(three()[..2].to_vec(), false, vec![]), NOW);
+        w.set_history_loading(true);
+        apply_at(&w, history(three()[2..].to_vec(), true, vec![]), NOW);
+        assert_eq!(w.get_commits().row_count(), 3);
+        assert_eq!(row(&w, 2).summary, "first");
+        assert!(!w.get_history_loading());
+        assert!(!w.get_history_exhausted());
+        apply_at(&w, history(vec![], true, vec![]), NOW);
+        assert!(w.get_history_exhausted());
+    }
+
+    #[test]
+    fn scrolled_to_end_sends_load_more_once() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        log.borrow_mut().clear();
+        w.invoke_history_scrolled_to_end();
+        w.invoke_history_scrolled_to_end();
+        assert!(matches!(log.borrow().as_slice(), [Command::LoadMoreHistory]));
+        apply_at(&w, history(vec![], true, vec![]), NOW);
+        w.invoke_history_scrolled_to_end();
+        assert_eq!(log.borrow().len(), 1, "exhausted: no more requests");
+    }
+
+    #[test]
+    fn select_commit_sends_commit_and_marks_row() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        log.borrow_mut().clear();
+        w.invoke_select_commit(id("c2"));
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Commit { id, path: None })] if *id == oid("c2")
+        ));
+        assert!(row(&w, 1).selected);
+        assert!(!row(&w, 0).selected);
+        // Invalid ids are ignored.
+        w.invoke_select_commit("zz".into());
+        assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn range_event_sets_banner() {
+        let w = window();
+        apply_at(
+            &w,
+            Event::Range(Some(RangeInfo {
+                base: oid("a1b2c3d"),
+                head: oid("ff"),
+                commit_count: 7,
+                additions: 48,
+                deletions: 12,
+            })),
+            NOW,
+        );
+        assert_eq!(w.get_range_banner(), "Reviewing 7 commits since a1b2c3d  +48 -12");
+    }
+
+    #[test]
+    fn review_since_sends_range_to_head() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        log.borrow_mut().clear();
+        w.invoke_review_since(id("c1"));
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Range { base, head, path: None })]
+                if *base == oid("c1") && *head == oid("c3")
+        ));
+        assert_eq!(w.get_history_mode(), 2);
+        // Base excluded, head included.
+        assert!(row(&w, 0).in_range);
+        assert!(row(&w, 1).in_range);
+        assert!(!row(&w, 2).in_range);
+    }
+
+    #[test]
+    fn shift_click_orders_base_and_head() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        w.invoke_select_commit(id("c1"));
+        log.borrow_mut().clear();
+        w.invoke_shift_select_commit(id("c2"));
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Range { base, head, path: None })]
+                if *base == oid("c1") && *head == oid("c2")
+        ));
+        assert!(!row(&w, 0).in_range);
+        assert!(row(&w, 1).in_range);
+        assert!(!row(&w, 2).in_range);
+    }
+
+    #[test]
+    fn shift_click_without_selection_selects_commit() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        log.borrow_mut().clear();
+        w.invoke_shift_select_commit(id("c2"));
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Commit { id, path: None })] if *id == oid("c2")
+        ));
+    }
+
+    #[test]
+    fn clear_range_and_single_select_exit_range() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        w.invoke_review_since(id("c1"));
+        w.set_range_banner("Reviewing".into());
+        w.set_commit_files(rows(&[entry("a.rs", FileStatus::Modified)], NO_SIDE));
+        log.borrow_mut().clear();
+        w.invoke_clear_range();
+        assert!(matches!(log.borrow().as_slice(), [Command::Select(Selection::None)]));
+        assert_eq!(w.get_range_banner(), "");
+        assert_eq!(w.get_history_mode(), 0);
+        assert_eq!(w.get_commit_files().row_count(), 0);
+        assert!(!row(&w, 0).in_range);
+
+        w.invoke_review_since(id("c1"));
+        w.set_range_banner("Reviewing".into());
+        w.invoke_select_commit(id("c2"));
+        assert_eq!(w.get_range_banner(), "");
+        assert_eq!(w.get_history_mode(), 1);
+        assert!(!row(&w, 0).in_range);
+    }
+
+    #[test]
+    fn range_none_keeps_banner_while_range_selected() {
+        let w = window();
+        let (_log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        w.invoke_review_since(id("c1"));
+        w.set_range_banner("Reviewing".into());
+        // Emitted when the Changes tab takes over the controller selection.
+        apply_at(&w, Event::Range(None), NOW);
+        assert_eq!(w.get_range_banner(), "Reviewing");
+        w.set_history_mode(1);
+        apply_at(&w, Event::Range(None), NOW);
+        assert_eq!(w.get_range_banner(), "");
+    }
+
+    #[test]
+    fn range_event_updates_head() {
+        let w = window();
+        let (_log, send) = recorder();
+        wire(&w, send);
+        let mut four = vec![commit("c4", "fourth", 5)];
+        four.extend(three());
+        apply_at(&w, history(four, false, vec![]), NOW);
+        w.invoke_review_since(id("c1"));
+        w.set_range_head(id("c3"));
+        apply_at(
+            &w,
+            Event::Range(Some(RangeInfo { base: oid("c1"), head: oid("c4"), commit_count: 3, additions: 1, deletions: 0 })),
+            NOW,
+        );
+        assert_eq!(w.get_range_head(), id("c4"));
+        assert!(row(&w, 0).in_range);
+        assert_eq!(w.get_range_banner(), "Reviewing 3 commits since c100000  +1 -0");
+    }
+
+    #[test]
+    fn files_event_fills_strip_and_selects_first() {
+        let w = window();
+        apply_at(
+            &w,
+            Event::Files(vec![entry("a.rs", FileStatus::Added), entry("b.rs", FileStatus::Deleted)]),
+            NOW,
+        );
+        let files = w.get_commit_files();
+        assert_eq!(files.row_count(), 2);
+        assert_eq!(files.row_data(1).unwrap().letter, "D");
+        assert_eq!(w.get_commit_file(), "a.rs");
+        assert!(files.row_data(0).unwrap().selected);
+        // A refresh that still lists the selected file keeps it.
+        w.set_commit_file("b.rs".into());
+        apply_at(
+            &w,
+            Event::Files(vec![entry("a.rs", FileStatus::Added), entry("b.rs", FileStatus::Deleted)]),
+            NOW,
+        );
+        assert_eq!(w.get_commit_file(), "b.rs");
+        assert!(w.get_commit_files().row_data(1).unwrap().selected);
+    }
+
+    #[test]
+    fn select_commit_file_sends_path() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        w.invoke_select_commit(id("c2"));
+        apply_at(&w, Event::Files(vec![entry("a.rs", FileStatus::Added), entry("b.rs", FileStatus::Modified)]), NOW);
+        log.borrow_mut().clear();
+        w.invoke_select_commit_file("b.rs".into());
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Commit { id, path: Some(p) })] if *id == oid("c2") && p == "b.rs"
+        ));
+        assert!(w.get_commit_files().row_data(1).unwrap().selected);
+
+        w.invoke_review_since(id("c1"));
+        log.borrow_mut().clear();
+        w.invoke_select_commit_file("a.rs".into());
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Range { base, head, path: Some(p) })]
+                if *base == oid("c1") && *head == oid("c3") && p == "a.rs"
+        ));
+    }
+
+    #[test]
+    fn history_diff_titles() {
+        let w = window();
+        let (_log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        w.invoke_select_commit(id("c2"));
+        apply_at(&w, Event::Diff(Some(text_view("a.rs", None, FileStatus::Modified))), NOW);
+        assert_eq!(w.get_left_title(), "Parent");
+        assert_eq!(w.get_right_title(), "c200000");
+        assert_eq!(w.get_commit_file(), "a.rs");
+        assert!(!w.get_hunk_actions());
+        assert_eq!(w.get_diff_side(), -1);
+        w.invoke_review_since(id("c1"));
+        apply_at(&w, Event::Diff(Some(text_view("a.rs", None, FileStatus::Modified))), NOW);
+        assert_eq!(w.get_left_title(), "c100000");
+        assert_eq!(w.get_right_title(), "c300000");
+    }
+
+    #[test]
+    fn tab_change_resends_tab_selection() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        apply(&w, status(&[], &[("x.rs", FileStatus::Modified)]));
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        w.invoke_select_change(1, "x.rs".into());
+        w.invoke_select_commit(id("c2"));
+        w.set_commit_file("a.rs".into());
+        log.borrow_mut().clear();
+        w.invoke_tab_changed(0);
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::Select(Selection::Change { side: ChangeSide::Unstaged, path })] if path == "x.rs"
+        ));
+        w.invoke_tab_changed(1);
+        assert!(matches!(
+            log.borrow().last(),
+            Some(Command::Select(Selection::Commit { id, path: Some(p) })) if *id == oid("c2") && p == "a.rs"
+        ));
+    }
+
+    #[test]
+    fn repo_opened_clears_history() {
+        let w = window();
+        let (_log, send) = recorder();
+        wire(&w, send);
+        apply_at(&w, history(three(), false, vec![]), NOW);
+        w.invoke_review_since(id("c1"));
+        w.set_range_banner("Reviewing".into());
+        w.set_commit_files(rows(&[entry("a.rs", FileStatus::Modified)], NO_SIDE));
+        w.set_commit_file("a.rs".into());
+        w.set_history_exhausted(true);
+        apply(&w, Event::RepoOpened { name: "p".into(), path: PathBuf::from("/tmp/p"), recent: vec![] });
+        assert_eq!(w.get_commits().row_count(), 0);
+        assert_eq!(w.get_commit_files().row_count(), 0);
+        assert_eq!(w.get_range_banner(), "");
+        assert_eq!(w.get_history_mode(), 0);
+        assert_eq!(w.get_range_base(), "");
+        assert_eq!(w.get_commit_file(), "");
+        assert!(!w.get_history_exhausted());
     }
 }

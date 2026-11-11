@@ -1,11 +1,11 @@
 // CodeDiff main window: top bar, tabs, sidebar and diff pane.
 import { ScrollView } from "std-widgets.slint";
 import { Theme, FlatButton } from "theme.slint";
-import { FileRow, ChangesSidebar } from "sidebar.slint";
+import { FileRow, CommitRow, ChangesSidebar, HistorySidebar, FileStrip } from "sidebar.slint";
 import { RepoMenu, ErrorBanner, ConfirmDialog } from "dialogs.slint";
 import { SegData, CellData, RowData, DiffPane } from "diffview.slint";
 
-export { FileRow, SegData, CellData, RowData }
+export { FileRow, CommitRow, SegData, CellData, RowData }
 
 component TabButton inherits Rectangle {
     in property <string> text;
@@ -159,6 +159,20 @@ export component AppWindow inherits Window {
     in-out property <string> discard-header;
     in-out property <string> discard-fingerprint;
 
+    // History tab.
+    in-out property <[CommitRow]> commits;
+    in-out property <[FileRow]> commit-files;
+    in-out property <string> range-banner; // empty when no range
+    // Selection: mode 0 none, 1 commit (history-commit), 2 range (range-base..range-head).
+    // Ids are full hex strings.
+    in-out property <int> history-mode: 0;
+    in-out property <string> history-commit;
+    in-out property <string> range-base;
+    in-out property <string> range-head;
+    in-out property <string> commit-file; // selected file in the strip
+    in-out property <bool> history-loading;
+    in-out property <bool> history-exhausted;
+
     callback open-repo-dialog();
     callback open-recent(string);
     callback select-change(int, string);
@@ -175,11 +189,23 @@ export component AppWindow inherits Window {
     callback confirm-discard();
     callback cancel-discard();
     callback load-full-diff();
+    callback select-commit(string);
+    callback shift-select-commit(string);
+    callback review-since(string);
+    callback clear-range();
+    callback select-commit-file(string);
+    callback history-scrolled-to-end();
+    // Fired when the tab changes so the bridge can re-show that tab's selection.
+    callback tab-changed(int);
 
     forward-focus: keys;
 
     changed dark => {
         root.dark-changed(root.dark);
+    }
+
+    changed active-tab => {
+        root.tab-changed(root.active-tab);
     }
 
     changed discard-kind => {
@@ -335,8 +361,28 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.active-tab == 1: Rectangle {
-                    background: Theme.window-bg;
+                if root.active-tab == 1: HistorySidebar {
+                    commits: root.commits;
+                    range-banner: root.range-banner;
+                    select-commit(id) => {
+                        root.select-commit(id);
+                        keys.focus();
+                    }
+                    shift-select-commit(id) => {
+                        root.shift-select-commit(id);
+                        keys.focus();
+                    }
+                    review-since(id) => {
+                        root.review-since(id);
+                        keys.focus();
+                    }
+                    clear-range => {
+                        root.clear-range();
+                        keys.focus();
+                    }
+                    scrolled-to-end => {
+                        root.history-scrolled-to-end();
+                    }
                 }
             }
 
@@ -368,6 +414,14 @@ export component AppWindow inherits Window {
                     text: root.error-text;
                     dismiss => {
                         root.dismiss-error();
+                    }
+                }
+
+                if root.active-tab == 1 && root.commit-files.length > 0: FileStrip {
+                    files: root.commit-files;
+                    select-file(path) => {
+                        root.select-commit-file(path);
+                        keys.focus();
                     }
                 }
 
@@ -425,6 +479,8 @@ export component AppWindow inherits Window {
                             text: root.active-tab == 0 && root.change-count == 0 ? "No changes"
                                 : root.active-tab == 0 && root.selected-path != "" ? root.selected-path
                                 : root.active-tab == 0 ? "Select a file to see its diff"
+                                : root.commits.length == 0 ? "No commits yet"
+                                : root.history-mode == 2 && root.commit-files.length == 0 ? "No changes in this range"
                                 : "Select a commit";
                             color: root.active-tab == 0 && root.selected-path != "" && root.change-count > 0
                                 ? Theme.text : Theme.text-muted;

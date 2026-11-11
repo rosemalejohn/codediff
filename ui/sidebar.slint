@@ -1,11 +1,11 @@
 // Left sidebar of the Changes tab: Staged and Unstaged groups of files.
-import { ScrollView } from "std-widgets.slint";
-import { Theme } from "theme.slint";
+import { ScrollView, ListView } from "std-widgets.slint";
+import { Theme, FlatButton } from "theme.slint";
 
 export struct FileRow {
     path: string,
     letter: string,
-    side: int, // 0 staged, 1 unstaged
+    side: int, // 0 staged, 1 unstaged, -1 history file strip
     selected: bool,
 }
 
@@ -98,5 +98,236 @@ export component ChangesSidebar inherits Rectangle {
                 }
             }
         }
+    }
+}
+
+export struct CommitRow {
+    id: string, // full hex id
+    short-id: string,
+    summary: string,
+    author: string,
+    when: string,
+    is-new: bool,
+    selected: bool,
+    in-range: bool,
+}
+
+component CommitRowView inherits Rectangle {
+    in property <CommitRow> commit;
+    callback clicked();
+    callback shift-clicked();
+    callback review-since();
+    // Shift state captured on press; `clicked` itself carries no modifiers.
+    property <bool> shift-down;
+
+    height: 44px;
+    background: commit.selected ? Theme.row-selected
+        : touch.has-hover ? Theme.row-hover
+        : commit.in-range ? Theme.row-in-range
+        : transparent;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 6px;
+
+        // "new" marker: a small dot, kept until the row is clicked.
+        Rectangle {
+            width: 6px;
+            Rectangle {
+                y: 10px;
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: root.commit.is-new ? Theme.accent : transparent;
+            }
+        }
+
+        VerticalLayout {
+            padding-top: 4px;
+            padding-bottom: 4px;
+            spacing: 2px;
+
+            Text {
+                text: root.commit.summary;
+                color: root.commit.selected ? Theme.row-selected-text : Theme.text;
+                font-size: Theme.font-size;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.commit.short-id + " \u{00B7} " + root.commit.author + " \u{00B7} " + root.commit.when;
+                color: Theme.text-muted;
+                font-size: Theme.small-font-size;
+                overflow: elide;
+            }
+        }
+    }
+
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: "Review since here";
+                activated => {
+                    root.review-since();
+                }
+            }
+        }
+
+        touch := TouchArea {
+            pointer-event(ev) => {
+                if ev.kind == PointerEventKind.down {
+                    root.shift-down = ev.modifiers.shift;
+                }
+            }
+            clicked => {
+                if root.shift-down {
+                    root.shift-clicked();
+                } else {
+                    root.clicked();
+                }
+            }
+        }
+    }
+}
+
+export component HistorySidebar inherits Rectangle {
+    in property <[CommitRow]> commits;
+    in property <string> range-banner;
+    callback select-commit(string);
+    callback shift-select-commit(string);
+    callback review-since(string);
+    callback clear-range();
+    callback scrolled-to-end();
+
+    background: Theme.window-bg;
+
+    VerticalLayout {
+        if root.range-banner != "": Rectangle {
+            height: 36px;
+            background: Theme.banner-bg;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 6px;
+                padding-top: 5px;
+                padding-bottom: 5px;
+                spacing: 6px;
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.range-banner;
+                    color: Theme.hunk-text;
+                    font-size: Theme.small-font-size;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                FlatButton {
+                    small: true;
+                    text: "Clear";
+                    clicked => {
+                        root.clear-range();
+                    }
+                }
+            }
+        }
+
+        if root.commits.length == 0: Rectangle {
+            vertical-stretch: 1;
+            Text {
+                text: "No commits yet";
+                color: Theme.text-muted;
+                font-size: Theme.font-size;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        if root.commits.length > 0: ListView {
+            vertical-stretch: 1;
+            changed content-y => {
+                if self.content-height > self.visible-height
+                    && self.content-y <= self.visible-height - self.content-height + 88px {
+                    root.scrolled-to-end();
+                }
+            }
+
+            for row in root.commits: CommitRowView {
+                commit: row;
+                clicked => {
+                    root.select-commit(row.id);
+                }
+                shift-clicked => {
+                    root.shift-select-commit(row.id);
+                }
+                review-since => {
+                    root.review-since(row.id);
+                }
+            }
+        }
+    }
+}
+
+// Horizontal strip of a commit's (or range's) changed files, above the diff.
+export component FileStrip inherits Rectangle {
+    in property <[FileRow]> files;
+    callback select-file(string);
+
+    height: 34px;
+    background: Theme.bar-bg;
+
+    ScrollView {
+        vertical-scrollbar-policy: always-off;
+
+        HorizontalLayout {
+            alignment: start;
+            padding-left: 6px;
+            padding-right: 6px;
+            padding-top: 4px;
+            padding-bottom: 4px;
+            spacing: 4px;
+
+            for f in root.files: Rectangle {
+                width: chip.preferred-width;
+                border-radius: 4px;
+                background: f.selected ? Theme.row-selected : (chip-touch.has-hover ? Theme.row-hover : transparent);
+
+                chip := HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 6px;
+
+                    Text {
+                        text: f.letter;
+                        color: Theme.letter-color(f.letter);
+                        font-weight: 700;
+                        font-family: Theme.mono-font;
+                        font-size: Theme.mono-font-size;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: f.path;
+                        color: f.selected ? Theme.row-selected-text : Theme.text;
+                        font-size: Theme.font-size;
+                        vertical-alignment: center;
+                    }
+                }
+
+                chip-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.select-file(f.path);
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.border;
     }
 }
