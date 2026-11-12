@@ -1,6 +1,6 @@
 // Right pane of the window: file header, column titles and the side-by-side rows.
 import { ListView } from "std-widgets.slint";
-import { Theme, FlatButton } from "theme.slint";
+import { Theme, Icons, Icon, FlatButton } from "theme.slint";
 
 export struct SegData {
     text: string,
@@ -23,6 +23,13 @@ export struct RowData {
     fingerprint: string,
     left: CellData,
     right: CellData,
+    // Expand controls of the hidden lines before this header (or after the
+    // last hunk when hunk-index is -1 on a header row). gap -1: none.
+    gap: int,
+    hidden: int,
+    expand-up: bool,
+    expand-down: bool,
+    expand-all: bool,
 }
 
 // Diagonal stripes for the side of a row that has no line.
@@ -57,9 +64,28 @@ component DiffCell inherits Rectangle {
         height: root.height;
     }
 
-    if root.cell.present: Text {
+    if root.cell.present && root.cell.kind != 0: Rectangle {
         x: 0px;
         width: root.gutter;
+        height: root.height;
+        background: root.cell.kind == 1 ? Theme.add-gutter : Theme.del-gutter;
+    }
+
+    if root.cell.present && root.cell.kind != 0: Text {
+        x: 3px;
+        width: 8px;
+        height: root.height;
+        text: root.cell.kind == 1 ? "+" : "\u{2212}";
+        color: root.cell.kind == 1 ? Theme.letter-added : Theme.letter-deleted;
+        font-family: Theme.mono-font;
+        font-size: Theme.mono-font-size;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if root.cell.present: Text {
+        x: 0px;
+        width: root.gutter - 6px;
         height: root.height;
         text: root.cell.no;
         color: Theme.gutter-text;
@@ -102,6 +128,81 @@ component DiffCell inherits Rectangle {
     }
 }
 
+// Arrow drawn in a 12x12 box; dir 0 up, 1 down, 2 both.
+component ExpandIcon inherits Path {
+    in property <int> dir;
+    width: 12px;
+    height: 12px;
+    viewbox-width: 12;
+    viewbox-height: 12;
+    stroke-width: 1.5px;
+    fill: transparent;
+    commands: dir == 0 ? "M 6 10 L 6 2 M 2.5 5.5 L 6 2 L 9.5 5.5"
+        : dir == 1 ? "M 6 2 L 6 10 M 2.5 6.5 L 6 10 L 9.5 6.5"
+        : "M 6 1 L 6 11 M 3 3.5 L 6 1 L 9 3.5 M 3 8.5 L 6 11 L 9 8.5";
+}
+
+// One expand control: fills its slot of the gutter.
+component ExpandButton inherits Rectangle {
+    in property <int> dir;
+    in property <int> hidden;
+    callback clicked();
+
+    background: touch.pressed ? Theme.expand-active : touch.has-hover ? Theme.expand-hover : Theme.expand-bg;
+
+    ExpandIcon {
+        dir: root.dir;
+        stroke: touch.has-hover ? Theme.expand-icon-hover : Theme.expand-icon;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Gutter-width column of expand buttons, stacked when there are two.
+component ExpandControls inherits Rectangle {
+    in property <RowData> data;
+    callback expand-gap(int, int);
+    property <int> count: (data.expand-up ? 1 : 0) + (data.expand-down ? 1 : 0) + (data.expand-all ? 1 : 0);
+
+    // Down (below the previous hunk) sits on top, up (above the next) below it.
+    if root.data.expand-down: ExpandButton {
+        y: 0px;
+        width: root.width;
+        height: root.height / root.count;
+        dir: 1;
+        hidden: root.data.hidden;
+        clicked => {
+            root.expand-gap(root.data.gap, 1);
+        }
+    }
+
+    if root.data.expand-up: ExpandButton {
+        y: root.data.expand-down ? root.height / 2 : 0px;
+        width: root.width;
+        height: root.height / root.count;
+        dir: 0;
+        hidden: root.data.hidden;
+        clicked => {
+            root.expand-gap(root.data.gap, 0);
+        }
+    }
+
+    if root.data.expand-all: ExpandButton {
+        width: root.width;
+        height: root.height;
+        dir: 2;
+        hidden: root.data.hidden;
+        clicked => {
+            root.expand-gap(root.data.gap, 2);
+        }
+    }
+}
+
 component HunkHeaderView inherits Rectangle {
     in property <RowData> data;
     in property <int> side;
@@ -109,19 +210,48 @@ component HunkHeaderView inherits Rectangle {
     callback stage-hunk(int, string, string);
     callback unstage-hunk(int, string, string);
     callback request-discard-hunk(int, string, string);
+    callback expand-gap(int, int);
+    // Matches DiffCell.gutter.
+    property <length> gutter: 44px;
+    property <bool> has-gap: data.gap >= 0;
 
     background: Theme.hunk-bg;
 
+    Rectangle {
+        y: 0px;
+        height: 1px;
+        background: Theme.border;
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.border;
+    }
+
+    if root.has-gap: ExpandControls {
+        x: 0px;
+        width: root.gutter;
+        height: root.height;
+        data: root.data;
+        expand-gap(g, d) => {
+            root.expand-gap(g, d);
+        }
+    }
+
     HorizontalLayout {
+        x: root.has-gap ? root.gutter : 0px;
+        width: root.width - self.x;
         padding-left: 8px;
         padding-right: 6px;
-        padding-top: 5px;
-        padding-bottom: 5px;
-        spacing: 6px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        spacing: 4px;
 
         Text {
             horizontal-stretch: 1;
-            text: root.data.header;
+            text: root.data.hunk-index >= 0 ? root.data.header
+                : root.data.hidden == 1 ? "1 unchanged line" : root.data.hidden + " unchanged lines";
             color: Theme.hunk-text;
             font-family: Theme.mono-font;
             font-size: Theme.mono-font-size;
@@ -129,25 +259,31 @@ component HunkHeaderView inherits Rectangle {
             overflow: elide;
         }
 
-        if root.actions && root.side == 1: FlatButton {
+        if root.actions && root.side == 1 && root.data.hunk-index >= 0: FlatButton {
             small: true;
+            ghost: true;
+            icon: Icons.plus;
             text: "Stage hunk";
             clicked => {
                 root.stage-hunk(root.data.hunk-index, root.data.header, root.data.fingerprint);
             }
         }
 
-        if root.actions && root.side == 1: FlatButton {
+        if root.actions && root.side == 1 && root.data.hunk-index >= 0: FlatButton {
             small: true;
             danger: true;
-            text: "Discard hunk";
+            ghost: true;
+            icon: Icons.undo;
+            text: "Discard";
             clicked => {
                 root.request-discard-hunk(root.data.hunk-index, root.data.header, root.data.fingerprint);
             }
         }
 
-        if root.actions && root.side == 0: FlatButton {
+        if root.actions && root.side == 0 && root.data.hunk-index >= 0: FlatButton {
             small: true;
+            ghost: true;
+            icon: Icons.minus;
             text: "Unstage hunk";
             clicked => {
                 root.unstage-hunk(root.data.hunk-index, root.data.header, root.data.fingerprint);
@@ -164,6 +300,7 @@ component DiffRowView inherits Rectangle {
     callback stage-hunk(int, string, string);
     callback unstage-hunk(int, string, string);
     callback request-discard-hunk(int, string, string);
+    callback expand-gap(int, int);
     property <length> half: (self.width - 1px) / 2;
 
     height: data.is-header ? Theme.diff-header-height : Theme.diff-line-height;
@@ -182,6 +319,9 @@ component DiffRowView inherits Rectangle {
         }
         request-discard-hunk(i, h, f) => {
             root.request-discard-hunk(i, h, f);
+        }
+        expand-gap(g, d) => {
+            root.expand-gap(g, d);
         }
     }
 
@@ -234,45 +374,83 @@ export component DiffPane inherits Rectangle {
     callback unstage-hunk(int, string, string);
     callback request-discard-hunk(int, string, string);
     callback load-full-diff();
+    callback expand-gap(int, int);
 
     background: Theme.window-bg;
 
     VerticalLayout {
-        // File header: path, counts and file actions.
+        // File header: name, directory, change stats and file actions.
         Rectangle {
-            height: 36px;
+            height: 48px;
             background: Theme.bar-bg;
 
             HorizontalLayout {
-                padding-left: 10px;
-                padding-right: 8px;
-                padding-top: 5px;
-                padding-bottom: 5px;
-                spacing: 8px;
+                padding-left: 16px;
+                padding-right: 12px;
+                spacing: 10px;
+
+                Icon {
+                    y: (parent.height - self.height) / 2;
+                    glyph: Icons.file;
+                    tint: Theme.text-muted;
+                }
 
                 Text {
                     text: root.path;
                     color: Theme.text-strong;
-                    font-size: Theme.font-size;
+                    font-size: Theme.title-font-size - 1px;
                     font-weight: 600;
                     vertical-alignment: center;
                     overflow: elide;
                 }
 
-                if root.mode == 0: Text {
-                    text: "+" + root.additions;
-                    color: Theme.letter-added;
-                    font-family: Theme.mono-font;
-                    font-size: Theme.mono-font-size;
-                    vertical-alignment: center;
-                }
+                if root.mode == 0: Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    height: 20px;
+                    width: stats.preferred-width;
+                    border-radius: Theme.radius-sm;
+                    background: Theme.surface;
 
-                if root.mode == 0: Text {
-                    text: "-" + root.deletions;
-                    color: Theme.letter-deleted;
-                    font-family: Theme.mono-font;
-                    font-size: Theme.mono-font-size;
-                    vertical-alignment: center;
+                    stats := HorizontalLayout {
+                        padding-left: 7px;
+                        padding-right: 7px;
+                        spacing: 6px;
+
+                        Text {
+                            text: "+" + root.additions;
+                            color: Theme.letter-added;
+                            font-family: Theme.mono-font;
+                            font-size: Theme.small-font-size;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: "\u{2212}" + root.deletions;
+                            color: Theme.letter-deleted;
+                            font-family: Theme.mono-font;
+                            font-size: Theme.small-font-size;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+
+                        // Five-block ratio bar, as on code review sites.
+                        HorizontalLayout {
+                            spacing: 2px;
+                            alignment: center;
+                            property <int> total: root.additions + root.deletions;
+                            property <int> green: self.total == 0 ? 0 : Math.round(5 * root.additions / self.total);
+
+                            for i in 5: Rectangle {
+                                y: (parent.height - self.height) / 2;
+                                width: 7px;
+                                height: 7px;
+                                border-radius: 1.5px;
+                                background: parent.total == 0 ? Theme.border-strong
+                                    : i < parent.green ? Theme.letter-added : Theme.letter-deleted;
+                            }
+                        }
+                    }
                 }
 
                 Rectangle {
@@ -280,22 +458,29 @@ export component DiffPane inherits Rectangle {
                 }
 
                 if root.side == 1: FlatButton {
-                    text: "Stage file";
-                    clicked => {
-                        root.stage-file();
-                    }
-                }
-
-                if root.side == 1: FlatButton {
-                    text: "Discard file";
+                    y: (parent.height - self.height) / 2;
+                    text: "Discard";
+                    icon: Icons.undo;
                     danger: true;
                     clicked => {
                         root.request-discard-file();
                     }
                 }
 
+                if root.side == 1: FlatButton {
+                    y: (parent.height - self.height) / 2;
+                    text: "Stage file";
+                    icon: Icons.plus;
+                    primary: true;
+                    clicked => {
+                        root.stage-file();
+                    }
+                }
+
                 if root.side == 0: FlatButton {
+                    y: (parent.height - self.height) / 2;
                     text: "Unstage file";
+                    icon: Icons.minus;
                     clicked => {
                         root.unstage-file();
                     }
@@ -311,15 +496,17 @@ export component DiffPane inherits Rectangle {
 
         // Column titles.
         if root.left-title != "" || root.right-title != "": Rectangle {
-            height: 22px;
+            height: 26px;
+            background: Theme.window-bg;
 
             Text {
-                x: 10px;
-                width: (parent.width - 1px) / 2 - 20px;
+                x: 16px;
+                width: (parent.width - 1px) / 2 - 26px;
                 height: parent.height;
                 text: root.left-title;
                 color: Theme.text-muted;
                 font-size: Theme.small-font-size;
+                font-weight: 600;
                 vertical-alignment: center;
                 overflow: elide;
             }
@@ -331,12 +518,13 @@ export component DiffPane inherits Rectangle {
             }
 
             Text {
-                x: (parent.width - 1px) / 2 + 11px;
-                width: (parent.width - 1px) / 2 - 20px;
+                x: (parent.width - 1px) / 2 + 17px;
+                width: (parent.width - 1px) / 2 - 26px;
                 height: parent.height;
                 text: root.right-title;
                 color: Theme.text-muted;
                 font-size: Theme.small-font-size;
+                font-weight: 600;
                 vertical-alignment: center;
                 overflow: elide;
             }
@@ -399,6 +587,9 @@ export component DiffPane inherits Rectangle {
                     request-discard-hunk(i, h, f) => {
                         root.request-discard-hunk(i, h, f);
                     }
+                    expand-gap(g, d) => {
+                        root.expand-gap(g, d);
+                    }
                 }
             }
 
@@ -449,10 +640,21 @@ export component DiffPane inherits Rectangle {
                 if root.mode == 2: HorizontalLayout {
                     alignment: center;
                     FlatButton {
+                        primary: true;
                         text: root.note;
                         clicked => {
                             root.load-full-diff();
                         }
+                    }
+                }
+
+                if root.mode != 2: HorizontalLayout {
+                    alignment: center;
+                    padding-bottom: 10px;
+                    Icon {
+                        size: 28px;
+                        glyph: Icons.file;
+                        tint: Theme.text-faint;
                     }
                 }
 

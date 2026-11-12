@@ -2,10 +2,13 @@
 use crate::controller::{Command, DiffView, Event, RangeInfo, Selection};
 use crate::history::relative_time;
 use crate::highlight::{StyledCell, StyledRow};
+use crate::sbs::{ExpandDir, GapCtl};
 use crate::model::{
     file_fingerprint, hunk_fingerprint, ChangeSide, CommitInfo, DiffBody, FileEntry, FileStatus, LineKind,
 };
-use crate::ui::{AppWindow, CellData, CommitRow, FileRow, RowData, SegData};
+use crate::settings::{Appearance, Settings};
+use crate::switcher::{project_name, rank};
+use crate::ui::{AppWindow, CellData, CommitRow, FileRow, ProjectItem, RowData, SegData};
 use git2::Oid;
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::collections::HashSet;
@@ -21,6 +24,10 @@ const MODE_TEXT: i32 = 0;
 const MODE_BINARY: i32 = 1;
 const MODE_TOO_LARGE: i32 = 2;
 const MODE_EMPTY: i32 = 3;
+
+// Directions of the diff pane's expand-gap callback.
+const EXPAND_UP: i32 = 0;
+const EXPAND_DOWN: i32 = 1;
 
 const DISCARD_NONE: i32 = 0;
 const DISCARD_FILE: i32 = 1;
@@ -63,8 +70,9 @@ pub fn apply(window: &AppWindow, ev: Event) {
 /// `apply` with an explicit clock (unix seconds) for relative commit times.
 fn apply_at(window: &AppWindow, ev: Event, now: i64) {
     match ev {
-        Event::RepoOpened { name, recent, .. } => {
+        Event::RepoOpened { name, path, recent } => {
             window.set_repo_name(name.into());
+            window.set_repo_path(display_path(&path).into());
             set_recent(window, &recent);
             window.set_has_repo(true);
             window.set_error_text(SharedString::new());
@@ -184,6 +192,7 @@ fn apply_history(window: &AppWindow, commits: &[CommitInfo], append: bool, new_i
             short_id: c.short_id.as_str().into(),
             summary: c.summary.as_str().into(),
             author: c.author.as_str().into(),
+            initial: c.author.chars().next().map(|ch| ch.to_uppercase().to_string()).unwrap_or_default().into(),
             when: relative_time(now, c.time).into(),
             selected: false,
             in_range: false,
@@ -436,7 +445,7 @@ fn apply_diff(window: &AppWindow, view: DiffView) {
 
 fn row_data(row: &StyledRow, fingerprints: &[String]) -> RowData {
     match row {
-        StyledRow::HunkHeader { hunk_index, header } => RowData {
+        StyledRow::HunkHeader { hunk_index, header, gap } => RowData {
             is_header: true,
             hunk_index: *hunk_index as i32,
             header: header.as_str().into(),
@@ -444,17 +453,35 @@ fn row_data(row: &StyledRow, fingerprints: &[String]) -> RowData {
                 .get(*hunk_index)
                 .map(|f| f.as_str().into())
                 .unwrap_or_default(),
-            left: CellData::default(),
-            right: CellData::default(),
+            ..gap_data(gap.as_ref())
+        },
+        StyledRow::Gap(g) => RowData {
+            is_header: true,
+            hunk_index: -1,
+            ..gap_data(Some(g))
         },
         StyledRow::Line { left, right } => RowData {
             is_header: false,
             hunk_index: -1,
-            header: SharedString::new(),
-            fingerprint: SharedString::new(),
             left: cell_data(left.as_ref()),
             right: cell_data(right.as_ref()),
+            ..gap_data(None)
         },
+    }
+}
+
+/// Expand controls of a header or trailing gap row (gap -1 when none).
+fn gap_data(gap: Option<&GapCtl>) -> RowData {
+    let Some(g) = gap else {
+        return RowData { gap: -1, ..RowData::default() };
+    };
+    RowData {
+        gap: g.gap as i32,
+        hidden: g.hidden as i32,
+        expand_up: g.up,
+        expand_down: g.down,
+        expand_all: g.all,
+        ..RowData::default()
     }
 }
 
@@ -542,6 +569,46 @@ pub fn set_recent(window: &AppWindow, paths: &[PathBuf]) {
     window.set_recent(ModelRc::new(VecModel::from(items)));
 }
 
+/// Fills the Cmd+K list with the recent projects matching `query`, best first,
+/// and highlights the first row. With no query the list keeps recency order
+/// and highlights the most recent project other than the open one.
+fn filter_projects(window: &AppWindow, query: &str) {
+    let paths: Vec<String> = window.get_recent().iter().map(|p| p.to_string()).collect();
+    let current = window.get_repo_path();
+    let items: Vec<ProjectItem> = rank(query, &paths)
+        .into_iter()
+        .map(|i| {
+            let p = paths[i].as_str();
+            ProjectItem { name: project_name(p).into(), path: p.into(), current: window.get_has_repo() && current == p }
+        })
+        .collect();
+    let index = if query.trim().is_empty() { items.iter().position(|i| !i.current).unwrap_or(0) } else { 0 };
+    window.set_switcher_index(index as i32);
+    window.set_switcher_items(ModelRc::new(VecModel::from(items)));
+}
+
+/// Applies a saved appearance choice (System follows macOS).
+pub fn set_appearance(window: &AppWindow, appearance: Appearance) {
+    window.set_appearance(appearance.index());
+}
+
+/// Handles the top-bar appearance switch: applies the choice and saves it.
+/// The theme change itself reaches the controller through `dark-changed`.
+pub fn wire_appearance(window: &AppWindow, settings_file: PathBuf) {
+    let weak = window.as_weak();
+    window.on_choose_appearance(move |i| {
+        let appearance = Appearance::from_index(i);
+        if let Some(w) = weak.upgrade() {
+            set_appearance(&w, appearance);
+        }
+        let mut settings = Settings::load_from(&settings_file);
+        settings.appearance = appearance;
+        if let Err(e) = settings.save_to(&settings_file) {
+            eprintln!("codediff: could not save settings: {e}");
+        }
+    });
+}
+
 /// Connects every UI callback to a controller command.
 pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     let s = send.clone();
@@ -557,6 +624,13 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
 
     let s = send.clone();
     window.on_open_recent(move |path| s(Command::OpenRepo(PathBuf::from(path.as_str()))));
+
+    let weak = window.as_weak();
+    window.on_switcher_filter(move |query| {
+        if let Some(w) = weak.upgrade() {
+            filter_projects(&w, &query);
+        }
+    });
 
     let s = send.clone();
     let weak = window.as_weak();
@@ -620,6 +694,12 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         if let Some(path) = shown_path(&w, SIDE_UNSTAGED) {
             s(Command::StageFile(path));
         }
+    });
+
+    let s = send.clone();
+    window.on_stage_path(move |side, path| {
+        let path = path.to_string();
+        s(if side == SIDE_STAGED { Command::UnstageFile(path) } else { Command::StageFile(path) });
     });
 
     let s = send.clone();
@@ -736,6 +816,18 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     let s = send.clone();
     window.on_load_full_diff(move || s(Command::LoadFullDiff));
 
+    let s = send.clone();
+    window.on_expand_gap(move |gap, dir| {
+        let dir = match dir {
+            EXPAND_UP => ExpandDir::Up,
+            EXPAND_DOWN => ExpandDir::Down,
+            _ => ExpandDir::All,
+        };
+        if let Ok(gap) = usize::try_from(gap) {
+            s(Command::ExpandGap { gap, dir });
+        }
+    });
+
     let weak = window.as_weak();
     window.on_dismiss_error(move || {
         if let Some(w) = weak.upgrade() {
@@ -843,6 +935,8 @@ fn rows(entries: &[FileEntry], side: i32) -> ModelRc<FileRow> {
     let rows: Vec<FileRow> = entries
         .iter()
         .map(|e| FileRow {
+            name: file_name(&e.path).into(),
+            dir: parent_dir(&e.path).into(),
             path: e.path.as_str().into(),
             letter: e.status.letter().to_string().into(),
             side,
@@ -850,6 +944,16 @@ fn rows(entries: &[FileEntry], side: i32) -> ModelRc<FileRow> {
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+/// Last path component, the part the sidebar shows first.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Everything before the last `/`, or empty for a top-level file.
+fn parent_dir(path: &str) -> &str {
+    path.rfind('/').map(|i| &path[..i]).unwrap_or("")
 }
 
 /// Sets each row's `selected` flag from the window's current selection.
@@ -1051,6 +1155,41 @@ mod tests {
         assert!(matches!(log.borrow().last(), Some(Command::SetDark(d)) if *d != dark));
     }
 
+    // ---- appearance ----
+
+    #[test]
+    fn forced_light_and_dark_override_system() {
+        let w = window();
+        set_appearance(&w, Appearance::Dark);
+        assert_eq!(w.get_appearance(), 2);
+        assert!(w.get_dark());
+        set_appearance(&w, Appearance::Light);
+        assert_eq!(w.get_appearance(), 1);
+        assert!(!w.get_dark());
+    }
+
+    #[test]
+    fn choosing_appearance_saves_it_and_sends_set_dark() {
+        let w = window();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+        let (log, send) = recorder();
+        set_appearance(&w, Appearance::Light);
+        wire(&w, send);
+        wire_appearance(&w, file.clone());
+
+        w.invoke_choose_appearance(2);
+        // `changed dark` handlers run when Slint processes change trackers.
+        slint::platform::update_timers_and_animations();
+        assert_eq!(w.get_appearance(), 2);
+        assert!(w.get_dark());
+        assert_eq!(Settings::load_from(&file).appearance, Appearance::Dark);
+        assert!(matches!(log.borrow().last(), Some(Command::SetDark(true))));
+
+        w.invoke_choose_appearance(0);
+        assert_eq!(Settings::load_from(&file).appearance, Appearance::System);
+    }
+
     // ---- diff view ----
 
     use crate::controller::DiffView;
@@ -1089,9 +1228,10 @@ mod tests {
                 body: DiffBody::Text(vec![h.clone()]),
                 additions: 1,
                 deletions: 0,
+                old_lines: Vec::new(),
             },
             rows: vec![
-                StyledRow::HunkHeader { hunk_index: 0, header: h.header.clone() },
+                StyledRow::HunkHeader { hunk_index: 0, header: h.header.clone(), gap: None },
                 StyledRow::Line { left: None, right: Some(cell(2, LineKind::Added, "b")) },
                 StyledRow::Line {
                     left: Some(cell(1, LineKind::Context, "a")),
@@ -1111,6 +1251,7 @@ mod tests {
                 body,
                 additions: 0,
                 deletions: 0,
+                old_lines: Vec::new(),
             },
             rows: Vec::new(),
             side: Some(ChangeSide::Unstaged),
@@ -1173,6 +1314,45 @@ mod tests {
         assert_eq!(w.get_diff_mode(), 1);
         assert_eq!(w.get_diff_note(), "Binary file, no preview (10 to 20 bytes)");
         assert_eq!(w.get_diff_rows().row_count(), 0);
+    }
+
+    #[test]
+    fn gap_controls_map_to_rows_and_expand_sends_command() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        let mut v = text_view("a.rs", Some(ChangeSide::Unstaged), FileStatus::Modified);
+        let ctl = |gap, hidden, up, down, all| GapCtl { gap, hidden, up, down, all };
+        v.rows[0] = StyledRow::HunkHeader {
+            hunk_index: 0,
+            header: "@@ -30 +30 @@".into(),
+            gap: Some(ctl(0, 29, true, false, false)),
+        };
+        v.rows.push(StyledRow::Gap(ctl(1, 1, false, true, false)));
+        apply(&w, Event::Diff(Some(v)));
+        let rows = w.get_diff_rows();
+        let h = rows.row_data(0).unwrap();
+        assert_eq!((h.gap, h.hidden, h.expand_up, h.expand_down), (0, 29, true, false));
+        assert_eq!(h.hunk_index, 0);
+        assert!(!h.fingerprint.is_empty());
+        assert_eq!(rows.row_data(1).unwrap().gap, -1);
+        let t = rows.row_data(3).unwrap();
+        assert!(t.is_header);
+        assert_eq!((t.hunk_index, t.gap, t.hidden, t.expand_down), (-1, 1, 1, true));
+
+        log.borrow_mut().clear();
+        w.invoke_expand_gap(0, 0);
+        w.invoke_expand_gap(1, 1);
+        w.invoke_expand_gap(2, 2);
+        w.invoke_expand_gap(-1, 2);
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [
+                Command::ExpandGap { gap: 0, dir: ExpandDir::Up },
+                Command::ExpandGap { gap: 1, dir: ExpandDir::Down },
+                Command::ExpandGap { gap: 2, dir: ExpandDir::All },
+            ]
+        ));
     }
 
     #[test]
@@ -1506,6 +1686,60 @@ mod tests {
             log.borrow().last(),
             Some(Command::Select(Selection::Change { side: ChangeSide::Staged, path })) if path == "a.rs"
         ));
+    }
+
+    fn opened(w: &AppWindow, path: &str, recent: &[&str]) {
+        apply(
+            w,
+            Event::RepoOpened {
+                name: project_name(path).into(),
+                path: PathBuf::from(path),
+                recent: recent.iter().map(PathBuf::from).collect(),
+            },
+        );
+    }
+
+    #[test]
+    fn switcher_lists_recent_and_highlights_previous_project() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        opened(&w, "/w/diffchecker", &["/w/diffchecker", "/w/wannahookup", "/w/api"]);
+        w.invoke_switcher_filter("".into());
+        let items = w.get_switcher_items();
+        assert_eq!(items.row_count(), 3);
+        let first = items.row_data(0).unwrap();
+        assert_eq!((first.name.as_str(), first.current), ("diffchecker", true));
+        assert_eq!(items.row_data(1).unwrap().path, "/w/wannahookup");
+        assert_eq!(w.get_switcher_index(), 1);
+
+        w.invoke_switcher_filter("whk".into());
+        let items = w.get_switcher_items();
+        assert_eq!(items.row_count(), 1);
+        assert_eq!(items.row_data(0).unwrap().name, "wannahookup");
+        assert_eq!(w.get_switcher_index(), 0);
+
+        w.invoke_switcher_filter("zzz".into());
+        assert_eq!(w.get_switcher_items().row_count(), 0);
+
+        log.borrow_mut().clear();
+        w.invoke_open_recent("/w/api".into());
+        assert!(matches!(log.borrow().as_slice(), [Command::OpenRepo(p)] if p == Path::new("/w/api")));
+    }
+
+    #[test]
+    fn cmd_k_opens_switcher_even_without_repo() {
+        let w = window();
+        let (_log, send) = recorder();
+        wire(&w, send);
+        w.show().unwrap();
+        set_recent(&w, &[PathBuf::from("/w/a"), PathBuf::from("/w/b")]);
+        press(&w, "k".into(), true);
+        assert!(w.get_switcher_open());
+        assert_eq!(w.get_switcher_items().row_count(), 2);
+        // Nothing open: no row is current, the first is highlighted.
+        assert_eq!(w.get_switcher_index(), 0);
+        assert!(!w.get_switcher_items().row_data(0).unwrap().current);
     }
 
     #[test]

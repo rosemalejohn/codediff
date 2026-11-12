@@ -1,7 +1,7 @@
 //! Debounced filesystem watcher for a repository working tree and its Git dirs.
 use crate::Result;
 use notify::RecursiveMode;
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, NoCache};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -59,7 +59,7 @@ pub fn is_relevant(root: &Path, path: &Path, is_ignored: &dyn Fn(&Path) -> bool)
 /// Watches a repo and calls `on_change` once per relevant debounced batch.
 /// Dropping the watcher stops it.
 pub struct RepoWatcher {
-    _debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
+    _debouncer: Debouncer<notify::RecommendedWatcher, NoCache>,
 }
 
 impl RepoWatcher {
@@ -91,7 +91,11 @@ impl RepoWatcher {
             .collect();
 
         let watch_root = root.clone();
-        let mut debouncer = new_debouncer(
+        // NoCache: the default file-id cache walks the whole tree (including
+        // ignored node_modules/target) before watching starts, which took
+        // seconds on large repos. It only pairs rename events, which we never
+        // use: any relevant change just triggers a refresh.
+        let mut debouncer = new_debouncer_opt::<_, notify::RecommendedWatcher, NoCache>(
             Duration::from_millis(150),
             None,
             move |res: DebounceEventResult| {
@@ -109,6 +113,8 @@ impl RepoWatcher {
                     on_change();
                 }
             },
+            NoCache::new(),
+            notify::Config::default(),
         )
         .map_err(|e| std::io::Error::other(e.to_string()))?;
         for dir in std::iter::once(&watch_root).chain(&extra) {

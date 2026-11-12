@@ -1,20 +1,29 @@
 // Overlay pieces: the repo menu popup content and the error banner.
-import { Theme, FlatButton } from "theme.slint";
+import { Theme, Icons, Icon, FlatButton, Kbd } from "theme.slint";
 
 component MenuItem inherits Rectangle {
     in property <string> text;
+    in property <string> icon: Icons.folder;
     in property <bool> emphasized: false;
     callback clicked();
-    height: 28px;
-    border-radius: 4px;
+    height: 30px;
+    border-radius: Theme.radius-sm + 1px;
     background: touch.has-hover ? Theme.row-selected : transparent;
 
-    Text {
+    Icon {
         x: 10px;
-        width: parent.width - 20px;
+        y: (parent.height - self.height) / 2;
+        size: 14px;
+        glyph: root.icon;
+        tint: root.emphasized ? Theme.accent : Theme.text-muted;
+    }
+
+    Text {
+        x: 32px;
+        width: parent.width - 42px;
         height: parent.height;
         text: root.text;
-        color: touch.has-hover ? Theme.row-selected-text : Theme.text;
+        color: root.emphasized ? Theme.accent : touch.has-hover ? Theme.row-selected-text : Theme.text;
         font-size: Theme.font-size;
         font-weight: root.emphasized ? 600 : 400;
         vertical-alignment: center;
@@ -37,18 +46,19 @@ export component RepoMenu inherits Rectangle {
     background: Theme.popup-bg;
     border-color: Theme.border;
     border-width: 1px;
-    border-radius: 6px;
-    drop-shadow-blur: 12px;
-    drop-shadow-color: #00000060;
+    border-radius: Theme.radius-lg - 2px;
+    drop-shadow-blur: 18px;
+    drop-shadow-offset-y: 4px;
+    drop-shadow-color: Theme.shadow;
 
     VerticalLayout {
-        padding: 4px;
+        padding: 5px;
         spacing: 0px;
 
         if root.recent.length > 0: Text {
-            height: 22px;
+            height: 24px;
             x: 10px;
-            text: "RECENT";
+            text: "RECENT REPOSITORIES";
             color: Theme.text-muted;
             font-size: Theme.small-font-size;
             font-weight: 600;
@@ -71,7 +81,8 @@ export component RepoMenu inherits Rectangle {
         }
 
         MenuItem {
-            text: "Open repository...";
+            text: "Open repository\u{2026}";
+            icon: Icons.plus;
             emphasized: true;
             clicked => {
                 root.open-repo-dialog();
@@ -86,14 +97,26 @@ export component ErrorBanner inherits Rectangle {
     callback dismiss();
 
     background: Theme.error-bg;
-    min-height: 36px;
+    min-height: 40px;
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.error-border;
+    }
 
     HorizontalLayout {
-        padding-left: 12px;
+        padding-left: 14px;
         padding-right: 8px;
-        padding-top: 5px;
-        padding-bottom: 5px;
+        padding-top: 6px;
+        padding-bottom: 6px;
         spacing: 10px;
+
+        Icon {
+            y: (parent.height - self.height) / 2;
+            glyph: Icons.alert;
+            tint: Theme.error-text;
+        }
 
         Text {
             text: root.text;
@@ -105,7 +128,11 @@ export component ErrorBanner inherits Rectangle {
         }
 
         FlatButton {
+            y: (parent.height - self.height) / 2;
             text: "Dismiss";
+            ghost: true;
+            small: true;
+            icon: Icons.close;
             vertical-stretch: 0;
             clicked => {
                 root.dismiss();
@@ -149,26 +176,48 @@ export component ConfirmDialog inherits Rectangle {
     }
 
     card := Rectangle {
-        width: min(400px, root.width - 40px);
+        width: min(420px, root.width - 40px);
         height: layout.preferred-height;
         x: (root.width - self.width) / 2;
         y: (root.height - self.height) / 2;
         background: Theme.popup-bg;
         border-color: Theme.border;
         border-width: 1px;
-        border-radius: 8px;
-        drop-shadow-blur: 16px;
-        drop-shadow-color: #00000070;
+        border-radius: Theme.radius-lg + 2px;
+        drop-shadow-blur: 32px;
+        drop-shadow-offset-y: 10px;
+        drop-shadow-color: Theme.shadow;
 
         layout := VerticalLayout {
-            padding: 18px;
-            spacing: 10px;
+            padding: 20px;
+            spacing: 12px;
 
-            Text {
-                text: root.title;
-                color: Theme.text-strong;
-                font-size: 14px;
-                font-weight: 600;
+            HorizontalLayout {
+                spacing: 12px;
+                alignment: start;
+
+                Rectangle {
+                    width: 36px;
+                    height: 36px;
+                    border-radius: 18px;
+                    background: Theme.danger-soft;
+
+                    Icon {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2 - 1px;
+                        size: 18px;
+                        glyph: Icons.alert;
+                        tint: Theme.danger-fg;
+                    }
+                }
+
+                Text {
+                    text: root.title;
+                    color: Theme.text-strong;
+                    font-size: Theme.title-font-size;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
             }
 
             Text {
@@ -178,22 +227,40 @@ export component ConfirmDialog inherits Rectangle {
                 wrap: word-wrap;
             }
 
+            Text {
+                text: "This cannot be undone.";
+                color: Theme.text-muted;
+                font-size: Theme.small-font-size + 0.5px;
+            }
+
             HorizontalLayout {
                 alignment: end;
                 spacing: 8px;
-                padding-top: 6px;
+                padding-top: 8px;
 
-                FlatButton {
-                    text: "Cancel";
-                    primary: true;
-                    clicked => {
-                        root.cancel();
+                // Cancel is the default: ring shows Return / Esc land here.
+                Rectangle {
+                    width: cancel-btn.min-width + 6px;
+                    height: 34px;
+                    border-radius: Theme.radius + 3px;
+                    border-width: 2px;
+                    border-color: Theme.accent-soft;
+
+                    cancel-btn := FlatButton {
+                        x: 3px;
+                        y: 3px;
+                        width: self.min-width;
+                        text: "Cancel";
+                        clicked => {
+                            root.cancel();
+                        }
                     }
                 }
 
                 FlatButton {
+                    y: 3px;
                     text: root.confirm-text;
-                    danger: true;
+                    danger-solid: true;
                     clicked => {
                         root.confirm();
                     }

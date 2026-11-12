@@ -215,3 +215,21 @@ fn staged_diff_errors_when_head_cannot_be_read() {
     assert!(file_diff(&t.repo, &DiffTarget::Staged, "a.txt", false).is_err());
     assert!(files_in_target(&t.repo, &DiffTarget::Staged).is_err());
 }
+
+#[test]
+fn old_lines_hold_old_side_file() {
+    let t = TestRepo::new();
+    t.write("a.txt", b"1\n2\n3\n");
+    t.stage("a.txt");
+    t.commit("c");
+    t.write("a.txt", b"1\nX\n3\n");
+    t.stage("a.txt");
+    t.write("a.txt", b"1\nY\n3\n");
+    let u = file_diff(&t.repo, &DiffTarget::Unstaged, "a.txt", false).unwrap().unwrap();
+    assert_eq!(u.old_lines, vec!["1", "X", "3"]);
+    let s = file_diff(&t.repo, &DiffTarget::Staged, "a.txt", false).unwrap().unwrap();
+    assert_eq!(s.old_lines, vec!["1", "2", "3"]);
+    t.write("new.txt", b"n\n");
+    let n = file_diff(&t.repo, &DiffTarget::Unstaged, "new.txt", false).unwrap().unwrap();
+    assert!(n.old_lines.is_empty());
+}

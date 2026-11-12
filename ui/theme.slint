@@ -1,60 +1,103 @@
-// Color palette and metrics shared by every view. Dark is the primary target.
+// Design tokens and small shared controls used by every view.
 import { Palette } from "std-widgets.slint";
 
 export global Theme {
-    in-out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    // 0 follows macOS, 1 forces light, 2 forces dark.
+    in-out property <int> appearance: 0;
+    in-out property <bool> dark: appearance == 0 ? Palette.color-scheme == ColorScheme.dark : appearance == 2;
 
-    out property <brush> window-bg: dark ? #1e1f22 : #ffffff;
-    out property <brush> bar-bg: dark ? #2b2d31 : #f3f3f4;
-    out property <brush> border: dark ? #333438 : #dcdde0;
-    out property <brush> text: dark ? #cfd2d6 : #1f2328;
-    out property <brush> text-strong: dark ? #ffffff : #000000;
-    out property <brush> text-muted: dark ? #80868b : #6e7781;
-    out property <brush> tab-on-bg: dark ? #3a3d43 : #e1e3e6;
-    out property <brush> tab-off-text: dark ? #9aa0a6 : #57606a;
-    out property <brush> row-hover: dark ? #26282c : #eef0f2;
-    out property <brush> row-selected: dark ? #2f4a6b : #cfe2ff;
-    out property <brush> row-selected-text: dark ? #ffffff : #0b1d33;
-    out property <brush> row-in-range: dark ? #24303f : #eaf2fc;
-    out property <brush> banner-bg: dark ? #25303d : #ddf4ff;
-    out property <brush> button-bg: dark ? #3a3d43 : #e7e8ea;
-    out property <brush> button-hover: dark ? #474a51 : #d9dbde;
-    out property <brush> button-text: dark ? #dddddd : #1f2328;
-    out property <brush> accent: dark ? #3874cb : #0969da;
+    // Surfaces, from back to front.
+    out property <brush> window-bg: dark ? #141518 : #ffffff;
+    out property <brush> sidebar-bg: dark ? #18191c : #f7f7f8;
+    out property <brush> bar-bg: dark ? #1c1d21 : #fafafb;
+    out property <brush> surface: dark ? #222328 : #f1f2f4;
+    out property <brush> popup-bg: dark ? #222328 : #ffffff;
+    out property <brush> border: dark ? #2a2c31 : #e5e6e9;
+    out property <brush> border-strong: dark ? #393b42 : #d3d5da;
+
+    // Text.
+    out property <brush> text: dark ? #d5d7dc : #24262b;
+    out property <brush> text-strong: dark ? #f3f4f6 : #0e0f12;
+    out property <brush> text-muted: dark ? #8d919a : #686c75;
+    out property <brush> text-faint: dark ? #6a6e77 : #8e939c;
+
+    // Controls.
+    out property <brush> tab-track: dark ? #141518 : #eceef1;
+    out property <brush> tab-on-bg: dark ? #2c2e34 : #ffffff;
+    out property <brush> tab-off-text: dark ? #9a9ea7 : #5b5f68;
+    out property <brush> row-hover: dark ? #212227 : #eceef1;
+    out property <brush> row-selected: dark ? #233250 : #dfe9fc;
+    out property <brush> row-selected-text: dark ? #ffffff : #0b1d3d;
+    out property <brush> row-in-range: dark ? #1b2232 : #eef3fd;
+    out property <brush> banner-bg: dark ? #1c2538 : #e8f0fe;
+    out property <brush> button-bg: dark ? #2a2c32 : #ffffff;
+    out property <brush> button-hover: dark ? #33363d : #f1f2f4;
+    out property <brush> button-border: dark ? #383a41 : #d3d5da;
+    out property <brush> button-text: dark ? #e2e4e8 : #24262b;
+    out property <brush> accent: dark ? #4f86f0 : #2563eb;
+    out property <brush> accent-hover: dark ? #6496f3 : #1d4fd8;
+    out property <brush> accent-soft: dark ? #4f86f02e : #2563eb1a;
     out property <brush> accent-text: #ffffff;
-    out property <brush> popup-bg: dark ? #2b2d31 : #ffffff;
-    out property <brush> error-bg: dark ? #5a2a2e : #ffebe9;
-    out property <brush> error-text: dark ? #ffd7d5 : #82071e;
+    out property <brush> badge-bg: dark ? #2c2e34 : #e7e9ed;
+    out property <brush> badge-text: dark ? #b5b9c1 : #4b4f58;
+    out property <brush> kbd-bg: dark ? #26282d : #ffffff;
+    out property <brush> kbd-border: dark ? #3a3c43 : #d3d5da;
+    out property <brush> error-bg: dark ? #3a1d21 : #fdecec;
+    out property <brush> error-border: dark ? #6b2b32 : #f5c2c2;
+    out property <brush> error-text: dark ? #ffcdd0 : #8a1020;
 
-    out property <brush> letter-added: dark ? #5fb760 : #1a7f37;
-    out property <brush> letter-modified: dark ? #e2b340 : #9a6700;
-    out property <brush> letter-deleted: dark ? #e06c6c : #cf222e;
-    out property <brush> letter-renamed: dark ? #8ab4f8 : #0969da;
+    // Git status colors, used for badges and +/- counts.
+    out property <brush> letter-added: dark ? #4cc38a : #16803c;
+    out property <brush> letter-modified: dark ? #e5b454 : #9a6400;
+    out property <brush> letter-deleted: dark ? #f2727b : #cf222e;
+    out property <brush> letter-renamed: dark ? #7aa7f7 : #2563eb;
 
     // Diff pane.
-    out property <brush> add-bg: dark ? #1f3a24 : #e6ffec;
-    out property <brush> del-bg: dark ? #46252a : #ffebe9;
-    out property <brush> add-word: dark ? #2e6b38 : #abf2bc;
-    out property <brush> del-word: dark ? #7a333b : #ffc1bd;
-    out property <brush> hunk-bg: dark ? #25303d : #ddf4ff;
-    out property <brush> hunk-text: dark ? #8ab4f8 : #0969da;
-    out property <brush> stripe: dark ? #2a2b2f : #ececee;
-    out property <brush> gutter-text: dark ? #666a70 : #8c959f;
-    out property <brush> danger-bg: dark ? #a8383d : #cf222e;
+    out property <brush> add-bg: dark ? #15301f : #e9f9ee;
+    out property <brush> del-bg: dark ? #3a1b20 : #fdeeee;
+    out property <brush> add-word: dark ? #1f5a35 : #b4eec6;
+    out property <brush> del-word: dark ? #6a2830 : #f9c4c4;
+    out property <brush> add-gutter: dark ? #183a25 : #d6f4df;
+    out property <brush> del-gutter: dark ? #451f25 : #fbdcdc;
+    out property <brush> hunk-bg: dark ? #182032 : #f0f5fe;
+    out property <brush> hunk-text: dark ? #8eb0ef : #2d5fc4;
+    // Expand-context buttons in the hunk header gutter.
+    out property <brush> expand-bg: dark ? #1f2a40 : #dde8fc;
+    out property <brush> expand-hover: dark ? #4f86f0 : #2563eb;
+    out property <brush> expand-active: dark ? #3a6fd6 : #1d4fd8;
+    out property <brush> expand-icon: dark ? #a8c2f3 : #2563eb;
+    out property <brush> expand-icon-hover: #ffffff;
+    out property <brush> stripe: dark ? #23252a : #eceef1;
+    out property <brush> gutter-text: dark ? #5e626b : #9a9ea6;
+    out property <brush> danger-bg: dark ? #d64550 : #d1242f;
+    out property <brush> danger-hover: dark ? #e25560 : #b71d27;
+    out property <brush> danger-soft: dark ? #d645502a : #d1242f14;
+    out property <brush> danger-fg: dark ? #f2858d : #c21f2a;
     out property <brush> danger-text: #ffffff;
-    out property <brush> scrollbar: dark ? #4a4d53 : #c4c7cc;
-    out property <brush> scrollbar-active: dark ? #6a6e75 : #9ea3a9;
-    out property <brush> scrim: dark ? #00000099 : #00000059;
+    out property <brush> scrollbar: dark ? #3d4047 : #c9ccd2;
+    out property <brush> scrollbar-active: dark ? #5d6169 : #9ea3aa;
+    out property <brush> scrim: dark ? #000000a6 : #0e0f1259;
+    out property <color> shadow: dark ? #00000099 : #0e0f1229;
 
+    // Type scale.
     out property <length> font-size: 13px;
     out property <length> small-font-size: 11px;
-    out property <length> row-height: 24px;
-    out property <length> bar-height: 40px;
+    out property <length> title-font-size: 15px;
     out property <length> mono-font-size: 12px;
     out property <string> mono-font: "Menlo";
+
+    // Metrics. 4px spacing rhythm.
+    out property <length> row-height: 28px;
+    out property <length> bar-height: 44px;
+    out property <length> radius-sm: 4px;
+    out property <length> radius: 6px;
+    out property <length> radius-lg: 10px;
     // Keep in sync with LINE_HEIGHT / HEADER_HEIGHT in src/ui_bridge.rs.
     out property <length> diff-line-height: 18px;
     out property <length> diff-header-height: 30px;
+
+    // Motion.
+    out property <duration> fast: 90ms;
 
     public pure function letter-color(letter: string) -> brush {
         if letter == "A" {
@@ -73,27 +116,151 @@ export global Theme {
     }
 }
 
-// Small flat button in the theme's style.
-export component FlatButton inherits Rectangle {
-    in property <string> text;
-    in property <bool> primary: false;
-    in property <bool> danger: false;
-    in property <bool> small: false;
-    callback clicked();
+// Stroke icons drawn on a 16x16 grid, one visual language (1.5px, round caps).
+export global Icons {
+    out property <string> folder: "M 2 4.5 A 1.5 1.5 0 0 1 3.5 3 L 6.2 3 L 7.7 4.6 L 12.5 4.6 A 1.5 1.5 0 0 1 14 6.1 L 14 11.5 A 1.5 1.5 0 0 1 12.5 13 L 3.5 13 A 1.5 1.5 0 0 1 2 11.5 Z";
+    out property <string> chevron-down: "M 4.5 6.5 L 8 10 L 11.5 6.5";
+    out property <string> chevron-right: "M 6.5 4.5 L 10 8 L 6.5 11.5";
+    out property <string> search: "M 7 2.5 A 4.5 4.5 0 1 1 6.99 2.5 Z M 10.3 10.3 L 13.5 13.5";
+    out property <string> plus: "M 8 3.5 L 8 12.5 M 3.5 8 L 12.5 8";
+    out property <string> minus: "M 3.5 8 L 12.5 8";
+    out property <string> undo: "M 5.5 3.5 L 2.5 6.5 L 5.5 9.5 M 2.5 6.5 L 10 6.5 A 3.5 3.5 0 0 1 10 13.5 L 7 13.5";
+    out property <string> close: "M 4 4 L 12 12 M 12 4 L 4 12";
+    out property <string> alert: "M 8 2 L 14.5 13.5 L 1.5 13.5 Z M 8 6.5 L 8 9.5 M 8 11.6 L 8 11.7";
+    out property <string> check-circle: "M 8 1.8 A 6.2 6.2 0 1 1 7.99 1.8 Z M 5.3 8.2 L 7.2 10 L 10.8 6.2";
+    out property <string> file: "M 4 1.8 L 9.5 1.8 L 12.5 4.8 L 12.5 14.2 L 4 14.2 Z M 9.5 1.8 L 9.5 4.8 L 12.5 4.8";
+    out property <string> commit: "M 8 5.2 A 2.8 2.8 0 1 1 7.99 5.2 Z M 8 1 L 8 5.2 M 8 10.8 L 8 15";
+    out property <string> changes: "M 3 4 L 13 4 M 3 8 L 13 8 M 3 12 L 9 12";
+    out property <string> clock: "M 8 1.8 A 6.2 6.2 0 1 1 7.99 1.8 Z M 8 4.5 L 8 8 L 10.5 9.5";
+}
 
-    height: small ? 20px : 26px;
-    min-width: label.preferred-width + (small ? 14px : 20px);
-    border-radius: small ? 4px : 5px;
-    background: danger ? (touch.has-hover ? Theme.danger-bg.darker(15%) : Theme.danger-bg)
-        : primary ? (touch.has-hover ? Theme.accent.darker(10%) : Theme.accent)
-        : (touch.has-hover ? Theme.button-hover : Theme.button-bg);
+export component Icon inherits Path {
+    in property <string> glyph;
+    in property <brush> tint: Theme.text;
+    in property <length> size: 16px;
+    width: size;
+    height: size;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    commands: glyph;
+    stroke: tint;
+    stroke-width: 1.5px;
+    stroke-line-cap: round;
+    stroke-line-join: round;
+    fill: transparent;
+}
+
+// Keyboard key cap, for shortcut hints.
+export component Kbd inherits Rectangle {
+    in property <string> text;
+    height: 18px;
+    width: max(18px, label.preferred-width + 10px);
+    border-radius: Theme.radius-sm;
+    background: Theme.kbd-bg;
+    border-width: 1px;
+    border-color: Theme.kbd-border;
 
     label := Text {
         text: root.text;
-        color: root.danger ? Theme.danger-text : root.primary ? Theme.accent-text : Theme.button-text;
-        font-size: root.small ? Theme.small-font-size : Theme.font-size;
+        color: Theme.text-muted;
+        font-size: Theme.small-font-size;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+}
+
+// Rounded count pill.
+export component CountBadge inherits Rectangle {
+    in property <int> count;
+    in property <bool> active: false;
+    height: 18px;
+    width: max(20px, label.preferred-width + 12px);
+    border-radius: 9px;
+    background: active ? Theme.accent-soft : Theme.badge-bg;
+
+    label := Text {
+        text: root.count;
+        color: root.active ? Theme.accent : Theme.badge-text;
+        font-size: Theme.small-font-size;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// Git status letter on a tinted square, so status reads without color alone.
+export component StatusBadge inherits Rectangle {
+    in property <string> letter;
+    width: 18px;
+    height: 18px;
+    border-radius: Theme.radius-sm;
+    background: Theme.letter-color(letter).with-alpha(0.16);
+
+    Text {
+        text: root.letter;
+        color: Theme.letter-color(root.letter);
+        font-family: Theme.mono-font;
+        font-size: Theme.small-font-size;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// Button in the theme's style. Default is a bordered neutral button;
+// `primary` fills with the accent, `danger` is a red outline that fills on
+// hover (`danger-solid` fills always), `ghost` has no chrome until hovered.
+export component FlatButton inherits Rectangle {
+    in property <string> text;
+    in property <string> icon;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> danger-solid: false;
+    in property <bool> ghost: false;
+    in property <bool> small: false;
+    callback clicked();
+
+    property <bool> hot: touch.has-hover;
+    property <brush> fg: danger-solid ? Theme.danger-text
+        : danger ? (hot ? Theme.danger-text : Theme.danger-fg)
+        : primary ? Theme.accent-text
+        : Theme.button-text;
+
+    height: small ? 22px : 28px;
+    min-width: layout.preferred-width;
+    preferred-width: layout.preferred-width;
+    horizontal-stretch: 0;
+    border-radius: small ? Theme.radius-sm + 1px : Theme.radius;
+    background: danger-solid ? (hot ? Theme.danger-hover : Theme.danger-bg)
+        : danger ? (hot ? Theme.danger-bg : (ghost ? transparent : Theme.danger-soft))
+        : primary ? (hot ? Theme.accent-hover : Theme.accent)
+        : ghost ? (hot ? Theme.button-hover : transparent)
+        : (hot ? Theme.button-hover : Theme.button-bg);
+    border-width: (primary || danger || danger-solid || ghost) ? 0px : 1px;
+    border-color: Theme.button-border;
+    opacity: touch.pressed ? 0.85 : 1.0;
+    animate background { duration: Theme.fast; }
+
+    layout := HorizontalLayout {
+        padding-left: root.small ? 7px : 11px;
+        padding-right: root.small ? 8px : 12px;
+        spacing: 5px;
+        alignment: center;
+
+        if root.icon != "": Icon {
+            y: (parent.height - self.height) / 2;
+            glyph: root.icon;
+            size: root.small ? 12px : 14px;
+            tint: root.fg;
+        }
+
+        if root.text != "": Text {
+            text: root.text;
+            color: root.fg;
+            font-size: root.small ? Theme.small-font-size + 0.5px : Theme.font-size;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
     }
 
     touch := TouchArea {

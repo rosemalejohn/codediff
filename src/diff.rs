@@ -120,7 +120,19 @@ pub(crate) fn delta_index(diff: &Diff<'_>, path: &str) -> Option<usize> {
     })
 }
 
-fn build(diff: &Diff<'_>, idx: usize, force_full: bool) -> Result<Option<FileDiff>> {
+/// Lines of the old side's blob, empty when there is none (added or untracked).
+fn old_side_lines(repo: &Repository, patch: &Patch<'_>) -> Vec<String> {
+    let id = patch.delta().old_file().id();
+    if id.is_zero() {
+        return Vec::new();
+    }
+    match repo.find_blob(id) {
+        Ok(b) => String::from_utf8_lossy(b.content()).lines().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn build(repo: &Repository, diff: &Diff<'_>, idx: usize, force_full: bool) -> Result<Option<FileDiff>> {
     let Some(patch) = Patch::from_diff(diff, idx)? else {
         return Ok(None);
     };
@@ -131,21 +143,22 @@ fn build(diff: &Diff<'_>, idx: usize, force_full: bool) -> Result<Option<FileDif
     let Some(entry) = entry_from_delta(patch.delta()) else {
         return Ok(None);
     };
-    let mk = |body, additions, deletions| FileDiff {
+    let mk = |body, additions, deletions, old_lines| FileDiff {
         path: entry.path.clone(),
         old_path: entry.old_path.clone(),
         status: entry.status,
         body,
         additions,
         deletions,
+        old_lines,
     };
     if is_bin {
-        return Ok(Some(mk(DiffBody::Binary { old_size, new_size }, 0, 0)));
+        return Ok(Some(mk(DiffBody::Binary { old_size, new_size }, 0, 0, Vec::new())));
     }
     let (ctx, add, del) = patch.line_stats()?;
     let total = ctx + add + del;
     if !force_full && (total > MAX_LINES || old_size.max(new_size) > MAX_BLOB_BYTES) {
-        return Ok(Some(mk(DiffBody::TooLarge { lines: total }, add as u32, del as u32)));
+        return Ok(Some(mk(DiffBody::TooLarge { lines: total }, add as u32, del as u32, Vec::new())));
     }
     let mut hunks = Vec::new();
     for h in 0..patch.num_hunks() {
@@ -175,7 +188,8 @@ fn build(diff: &Diff<'_>, idx: usize, force_full: bool) -> Result<Option<FileDif
             lines,
         });
     }
-    Ok(Some(mk(DiffBody::Text(hunks), add as u32, del as u32)))
+    let old_lines = old_side_lines(repo, &patch);
+    Ok(Some(mk(DiffBody::Text(hunks), add as u32, del as u32, old_lines)))
 }
 
 /// Diff of one path in a target, or None when the path has no change there.
@@ -208,10 +222,10 @@ pub fn file_diff(
             .deltas()
             .position(|d| d.new_file().path().is_some_and(|p| p.to_str() == Some(path)));
         if let Some(i) = hit {
-            return build(&full, i, force_full);
+            return build(repo, &full, i, force_full);
         }
     }
-    build(&diff, idx, force_full)
+    build(repo, &diff, idx, force_full)
 }
 
 pub fn files_in_target(repo: &Repository, target: &DiffTarget) -> Result<Vec<FileEntry>> {

@@ -1,6 +1,6 @@
 # CodeDiff
 
-A fast, native macOS Git diff viewer built with Rust and Slint. Point it at a repository to review working tree changes, staged changes, commit history and commit ranges, with side-by-side or unified diffs, syntax highlighting, and file or hunk level stage, unstage and discard. It watches the repo, so changes made by editors or coding agents show up automatically.
+A fast, native macOS Git diff viewer built with Rust and Slint. Point it at a repository to review working tree changes, staged changes, commit history and commit ranges, with side-by-side diffs, syntax highlighting, and file or hunk level stage, unstage and discard. It watches the repo, so changes made by editors or coding agents show up automatically.
 
 Target: Apple Silicon, macOS 12 or later.
 
@@ -24,12 +24,18 @@ Produces `dist/CodeDiff.app` (ad-hoc signed, bundle id `com.codediff.app`) and `
 
 The app is not notarized. After dragging it to Applications, the first launch is blocked. Open System Settings > Privacy & Security, find the CodeDiff message and click "Open Anyway", then confirm. Alternatively, right-click the app and choose Open.
 
+## Appearance
+
+Use the System / Light / Dark switch at the right end of the top bar. System follows the macOS appearance. The choice is saved in `~/Library/Application Support/codediff/settings.json`.
+
 ## Keyboard shortcuts
 
 | Key | Action |
 | --- | --- |
+| Cmd+K | Open the project switcher: fuzzy search recent projects by name (include `/` to search the full path), Up / Down to pick, Return or click to open, Esc to close |
 | Up / Down | Move selection in the file list (Changes tab) or the commit list (History tab) |
 | s | Stage the selected file (Changes tab) |
+| (hover) + / - | The button at the right of a file row stages or unstages that file without selecting it |
 | u | Unstage the selected file (Changes tab) |
 | Cmd+Backspace | Open the discard confirmation dialog for the selected file (Changes tab; never discards directly) |
 | Esc / Return | Cancel the open confirmation dialog |

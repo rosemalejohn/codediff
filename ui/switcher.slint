@@ -1,0 +1,222 @@
+// Cmd+K project switcher: fuzzy search box over the recent projects.
+import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export struct ProjectItem {
+    name: string,
+    path: string,
+    // The project open now.
+    current: bool,
+}
+
+component ProjectRow inherits Rectangle {
+    in property <ProjectItem> item;
+    in property <bool> selected;
+    callback clicked();
+    callback hovered();
+
+    height: 46px;
+    background: root.selected ? Theme.row-selected : transparent;
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 8px;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+
+            Text {
+                text: root.item.name;
+                color: root.selected ? Theme.row-selected-text : Theme.text-strong;
+                font-size: Theme.font-size;
+                font-weight: 600;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.item.path;
+                color: Theme.text-muted;
+                font-size: Theme.small-font-size;
+                overflow: elide;
+            }
+        }
+
+        if root.item.current: Text {
+            text: "current";
+            color: Theme.text-muted;
+            font-size: Theme.small-font-size;
+            vertical-alignment: center;
+        }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        moved => {
+            root.hovered();
+        }
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+export component ProjectSwitcher inherits Rectangle {
+    in property <[ProjectItem]> items;
+    in-out property <int> index;
+    in-out property <string> query;
+    callback filter(string);
+    callback activate(ProjectItem);
+    callback close();
+
+    property <length> row-height: 46px;
+    property <int> max-rows: 8;
+
+    public function focus-input() {
+        input.focus();
+    }
+
+    // Moves the selection and scrolls it into view.
+    function move(step: int) {
+        if root.items.length == 0 {
+            return;
+        }
+        root.index = Math.clamp(root.index + step, 0, root.items.length - 1);
+        let top = root.index * root.row-height;
+        if top < -list.content-y {
+            list.content-y = -top;
+        } else if top + root.row-height > -list.content-y + list.visible-height {
+            list.content-y = -(top + root.row-height - list.visible-height);
+        }
+    }
+
+    background: #00000059;
+
+    // Backdrop: a click outside the panel closes it.
+    TouchArea {
+        clicked => {
+            root.close();
+        }
+    }
+
+    panel := Rectangle {
+        width: min(560px, root.width - 32px);
+        height: layout.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: min(80px, root.height / 8);
+        background: Theme.popup-bg;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 6px;
+        drop-shadow-color: #00000060;
+        clip: true;
+
+        // Swallows clicks so they do not reach the backdrop.
+        TouchArea { }
+
+        layout := VerticalLayout {
+            // Search box.
+            Rectangle {
+                height: 44px;
+
+                FocusScope {
+                    x: 14px;
+                    width: parent.width - 28px;
+                    height: parent.height;
+                    capture-key-pressed(e) => {
+                        if e.text == Key.UpArrow {
+                            root.move(-1);
+                            return accept;
+                        }
+                        if e.text == Key.DownArrow {
+                            root.move(1);
+                            return accept;
+                        }
+                        if e.text == Key.Return {
+                            if root.index >= 0 && root.index < root.items.length {
+                                root.activate(root.items[root.index]);
+                            }
+                            return accept;
+                        }
+                        if e.text == Key.Escape {
+                            root.close();
+                            return accept;
+                        }
+                        reject
+                    }
+
+                    if root.query == "": Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: "Search projects";
+                        color: Theme.text-muted;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+
+                    input := TextInput {
+                        width: parent.width;
+                        height: parent.height;
+                        text <=> root.query;
+                        single-line: true;
+                        color: Theme.text-strong;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                        edited => {
+                            root.filter(self.text);
+                            list.content-y = 0px;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    y: parent.height - 1px;
+                    height: 1px;
+                    background: Theme.border;
+                }
+            }
+
+            list := ListView {
+                height: min(root.items.length, root.max-rows) * root.row-height;
+
+                for item[i] in root.items: ProjectRow {
+                    item: item;
+                    selected: i == root.index;
+                    hovered => {
+                        root.index = i;
+                    }
+                    clicked => {
+                        root.activate(item);
+                    }
+                }
+            }
+
+            if root.items.length == 0: Text {
+                height: 44px;
+                text: "No matching projects";
+                color: Theme.text-muted;
+                font-size: Theme.font-size;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            // Key hints.
+            Rectangle {
+                height: 28px;
+                background: Theme.bar-bg;
+
+                Text {
+                    x: 14px;
+                    height: parent.height;
+                    text: "\u{2191}\u{2193} navigate   enter open   esc close";
+                    color: Theme.text-muted;
+                    font-size: Theme.small-font-size;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

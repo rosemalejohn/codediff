@@ -1,5 +1,6 @@
 use codediff::controller::{Command, Controller};
 use codediff::recent::RecentRepos;
+use codediff::settings::Settings;
 use codediff::ui::AppWindow;
 use codediff::ui_bridge;
 use slint::ComponentHandle;
@@ -9,6 +10,11 @@ use std::rc::Rc;
 fn main() -> Result<(), slint::PlatformError> {
     let process_start = std::time::Instant::now();
     let window = AppWindow::new()?;
+
+    // Apply the saved appearance before anything reads the theme.
+    let settings_file = Settings::default_file();
+    ui_bridge::set_appearance(&window, Settings::load_from(&settings_file).appearance);
+    ui_bridge::wire_appearance(&window, settings_file);
 
     let recent_file = RecentRepos::default_file();
     let recent = RecentRepos::load_from(&recent_file);

@@ -705,3 +705,27 @@ fn linked_worktree_index_and_commit_trigger_refresh() {
         .unwrap();
     h.wait_for(m, |e| matches!(e, Event::History { new_ids, .. } if new_ids == &vec![c2]));
 }
+
+#[test]
+fn expand_gap_reveals_unchanged_lines_and_resets_on_select() {
+    use codediff::highlight::StyledRow;
+    use codediff::sbs::ExpandDir;
+    let lines = |v: &codediff::controller::DiffView| v.rows.iter().filter(|r| matches!(r, StyledRow::Line { .. })).count();
+    let t = two_hunk_repo();
+    let h = Harness::new();
+    h.open(t.path());
+    let v = select_unstaged(&h, "f.txt");
+    let before = lines(&v);
+    // Hunks cover old 1..=5 and 15..=20: the middle gap is lines 6..=14.
+    assert!(v.rows.iter().any(|r| matches!(r, StyledRow::HunkHeader { hunk_index: 1, gap: Some(g), .. } if g.hidden == 9 && g.all)));
+
+    let m = h.mark();
+    h.ctl.send(Command::ExpandGap { gap: 1, dir: ExpandDir::All });
+    let Event::Diff(Some(x)) = h.wait_for(m, |e| matches!(e, Event::Diff(Some(_)))).1 else { unreachable!() };
+    assert_eq!(lines(&x), before + 9);
+    assert!(x.rows.iter().any(|r| matches!(r, StyledRow::HunkHeader { hunk_index: 1, gap: None, .. })));
+    assert_eq!(hunk_keys(&x), hunk_keys(&v), "hunks unchanged by expansion");
+
+    let again = select_unstaged(&h, "f.txt");
+    assert_eq!(lines(&again), before);
+}

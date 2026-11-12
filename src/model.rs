@@ -88,6 +88,9 @@ pub struct FileDiff {
     pub body: DiffBody,
     pub additions: u32,
     pub deletions: u32,
+    /// Lines of the old side's file (Text bodies only; empty when there is no
+    /// old side). Source of the unchanged lines shown when context is expanded.
+    pub old_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -103,3 +103,24 @@ fn ignored_dir_writes_do_not_fire() {
     std::thread::sleep(Duration::from_millis(1000));
     assert_eq!(c.load(Ordering::SeqCst), 0);
 }
+
+// Starting the watcher must not walk the tree: a big ignored folder
+// (node_modules, target) used to cost seconds before the repo appeared.
+#[test]
+fn start_does_not_scan_large_trees() {
+    let t = TestRepo::new();
+    t.write(".gitignore", b"node_modules/\n");
+    t.stage(".gitignore");
+    t.commit("ignore");
+    for d in 0..40 {
+        let dir = t.path().join(format!("node_modules/pkg{d}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in 0..500 {
+            std::fs::write(dir.join(format!("f{f}.js")), b"x").unwrap();
+        }
+    }
+    let start = std::time::Instant::now();
+    let _w = RepoWatcher::start(t.path().to_path_buf(), || {}).unwrap();
+    let took = start.elapsed();
+    assert!(took < Duration::from_millis(50), "watcher start took {took:?}");
+}

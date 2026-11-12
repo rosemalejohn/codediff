@@ -8,7 +8,7 @@ use crate::model::{
 };
 use crate::recent::RecentRepos;
 use crate::repo::{open_repo, repo_name};
-use crate::sbs::build_rows;
+use crate::sbs::{build_rows_expanded, ExpandDir, Expansion};
 use crate::stage;
 use crate::status::list_status;
 use crate::watch::RepoWatcher;
@@ -48,6 +48,11 @@ pub enum Command {
     Refresh,
     Select(Selection),
     LoadFullDiff,
+    /// Reveal unchanged lines of gap `gap` (see `sbs::Expansion`) in the shown diff.
+    ExpandGap {
+        gap: usize,
+        dir: ExpandDir,
+    },
     LoadMoreHistory,
     StageFile(String),
     UnstageFile(String),
@@ -135,6 +140,7 @@ impl Controller {
                     open: None,
                     selection: Selection::None,
                     force_full: false,
+                    expand: Vec::new(),
                     view: None,
                 };
                 w.run(rx);
@@ -180,6 +186,8 @@ struct Worker {
     open: Option<OpenRepo>,
     selection: Selection,
     force_full: bool,
+    /// Expansion of each gap of the shown diff; reset when the selection changes.
+    expand: Vec<Expansion>,
     view: Option<DiffView>,
 }
 
@@ -261,6 +269,16 @@ impl Worker {
                 self.force_full = true;
                 self.emit_diff();
             }
+            Command::ExpandGap { gap, dir } => {
+                if self.view.is_none() {
+                    return;
+                }
+                if self.expand.len() <= gap {
+                    self.expand.resize(gap + 1, Expansion::default());
+                }
+                self.expand[gap].apply(dir);
+                self.emit_diff();
+            }
             Command::LoadMoreHistory => self.load_more_history(),
             Command::StageFile(p) => self.mutate(|r| stage::stage_file(r, &p)),
             Command::UnstageFile(p) => self.mutate(|r| stage::unstage_file(r, &p)),
@@ -337,6 +355,7 @@ impl Worker {
         });
         self.selection = Selection::None;
         self.force_full = false;
+        self.expand.clear();
         self.view = None;
         let name = repo_name(&self.open.as_ref().unwrap().repo);
         self.emit(Event::RepoOpened {
@@ -441,6 +460,7 @@ impl Worker {
         let was_range = matches!(self.selection, Selection::Range { .. });
         self.selection = sel;
         self.force_full = false;
+        self.expand.clear();
         let moved = self.follow_head();
         match &self.selection {
             Selection::Range { path: None, .. } => {
@@ -543,7 +563,17 @@ impl Worker {
     /// Emits the diff of the current selection. Returns false when the selected
     /// path has no diff (Diff(None) emitted in that case too).
     fn emit_diff(&mut self) -> bool {
-        let built = self.build_view();
+        // Gap indexes shift when another file shows or the hunk count changes.
+        let hunks = |v: &Option<DiffView>| match v.as_ref().map(|v| (&v.file.path, &v.file.body)) {
+            Some((p, DiffBody::Text(h))) => Some((p.clone(), h.len())),
+            _ => None,
+        };
+        let before = hunks(&self.view);
+        let mut built = self.build_view();
+        if !self.expand.is_empty() && hunks(&built) != before {
+            self.expand.clear();
+            built = self.build_view();
+        }
         let ok = built.is_some();
         self.view = built.clone();
         self.emit(Event::Diff(built));
@@ -556,7 +586,10 @@ impl Worker {
         let path = path?;
         let file = self.report(file_diff(&o.repo, &target, &path, self.force_full))??;
         let rows = match &file.body {
-            DiffBody::Text(hunks) => self.hl.highlight_rows(&path, &build_rows(hunks), self.dark),
+            DiffBody::Text(hunks) => {
+                let rows = build_rows_expanded(hunks, &file.old_lines, &self.expand);
+                self.hl.highlight_rows(&path, &rows, &file.old_lines, self.dark)
+            }
             _ => Vec::new(),
         };
         Some(DiffView { file, rows, side })
