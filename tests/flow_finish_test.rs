@@ -649,12 +649,28 @@ fn finish_names_the_step_that_stopped() {
     let err = finish(&t.repo, &cfg, &feature_req("feature/x"));
     std::fs::remove_file(&lock).unwrap();
 
-    assert!(matches!(
-        err,
-        Err(CoreError::Flow(ref m)) if m == "Finish stopped at: Delete feature/x. \
-            Already done: Merge feature/x into develop, Switch to develop."
-    ));
+    let Err(CoreError::Flow(m)) = err else { panic!("expected a Flow error, got {err:?}") };
+    let (head, cause) = m.split_once(" Cause: ").expect("message names the cause");
+    assert_eq!(head, "Finish stopped at: Delete feature/x. Already done: Merge feature/x into develop, Switch to develop.");
+    assert!(!cause.trim().is_empty());
     assert_eq!(t.tip("develop"), feature_tip);
     assert_eq!(t.head_branch(), "develop");
     assert!(t.has_branch("feature/x"));
+}
+
+/// The remote delete is leased on the commit last seen on origin, not on the
+/// local tip, so unpushed commits on the finished branch do not break it.
+#[test]
+fn finish_push_delete_leases_origin_tip() {
+    let (t, cfg) = release_repo();
+    let origin_tip = t.tip("release/1.2.0");
+    set_ref(&t.repo, "refs/remotes/origin/release/1.2.0", origin_tip);
+    let local_tip = t.commit_file("notes.txt", b"unpushed\n", "unpushed commit");
+    assert_ne!(origin_tip, local_tip);
+    let mut req = release_req("release/1.2.0", "1.2.0", "Release 1.2.0");
+    req.push = true;
+
+    let out = finish(&t.repo, &cfg, &req).unwrap();
+    assert_eq!(out.push.unwrap().delete, Some(("release/1.2.0".to_string(), origin_tip)));
+    assert!(!t.has_branch("release/1.2.0"));
 }

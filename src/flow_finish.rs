@@ -96,7 +96,10 @@ pub struct PushSpec {
     /// Production, then develop.
     pub branches: Vec<String>,
     pub tag: String,
-    /// Remote branch to delete and the tip it must still have.
+    /// Remote branch to delete and the commit origin must still have for it:
+    /// the target of `refs/remotes/origin/{branch}` when the finish ran (the
+    /// commit last seen on origin), not the local branch tip, which may hold
+    /// unpushed commits.
     pub delete: Option<(String, Oid)>,
 }
 
@@ -403,10 +406,11 @@ pub fn finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Resul
     let branch_tip = tip(repo, b)?;
     let develop_tip = tip(repo, &cfg.develop)?;
     let production_tip = if feature { None } else { Some(tip(repo, &cfg.production)?) };
-    let delete_on_origin = !feature
-        && req.push
-        && req.delete_branch
-        && repo.find_reference(&format!("refs/remotes/origin/{b}")).is_ok();
+    // Read before any reference moves.
+    let origin_tip = match repo.find_reference(&format!("refs/remotes/origin/{b}")) {
+        Ok(r) if !feature && req.push && req.delete_branch => Some(r.peel_to_commit()?.id()),
+        _ => None,
+    };
 
     // New commits, referenced by nothing yet.
     let (production, develop_tree) = match simulate(repo, cfg, req)? {
@@ -464,9 +468,9 @@ pub fn finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Resul
 
     let mut done: Vec<String> = Vec::new();
     for (text, run) in moves {
-        if run().is_err() {
+        if let Err(cause) = run() {
             let done = if done.is_empty() { "nothing".to_string() } else { done.join(", ") };
-            return Err(CoreError::Flow(format!("Finish stopped at: {text}. Already done: {done}.")));
+            return Err(CoreError::Flow(format!("Finish stopped at: {text}. Already done: {done}. Cause: {cause}")));
         }
         done.push(text);
     }
@@ -482,7 +486,7 @@ pub fn finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Resul
     let push = req.push.then(|| PushSpec {
         branches: vec![cfg.production.clone(), develop.clone()],
         tag: req.tag.clone(),
-        delete: delete_on_origin.then(|| (b.clone(), branch_tip)),
+        delete: origin_tip.map(|id| (b.clone(), id)),
     });
     let pushed_notice = match push {
         Some(_) => format!(
