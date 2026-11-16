@@ -1,5 +1,6 @@
 #![allow(dead_code)]
-use codediff::flow::{init, FlowConfig};
+use codediff::flow::{init, FlowConfig, FlowKind};
+use codediff::flow_finish::FinishRequest;
 use git2::{Oid, Repository};
 use std::path::Path;
 use tempfile::TempDir;
@@ -143,4 +144,28 @@ pub fn flow_repo() -> (TestRepo, FlowConfig) {
     let cfg = default_config(&t.head_branch());
     init(&t.repo, &cfg).unwrap();
     (t, cfg)
+}
+
+/// Finish request for a feature: no tag, delete the branch, no push.
+pub fn feature_req(branch: &str) -> FinishRequest {
+    FinishRequest {
+        kind: FlowKind::Feature,
+        branch: branch.into(),
+        tag: String::new(),
+        message: String::new(),
+        delete_branch: true,
+        push: false,
+    }
+}
+
+/// Finish request for a release: delete the branch, no push.
+pub fn release_req(branch: &str, tag: &str, message: &str) -> FinishRequest {
+    FinishRequest {
+        kind: FlowKind::Release,
+        branch: branch.into(),
+        tag: tag.into(),
+        message: message.into(),
+        delete_branch: true,
+        push: false,
+    }
 }

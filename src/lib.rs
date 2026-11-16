@@ -4,6 +4,7 @@ pub mod controller;
 pub mod diff;
 pub mod error;
 pub mod flow;
+pub mod flow_finish;
 pub mod highlight;
 pub mod history;
 pub mod model;
