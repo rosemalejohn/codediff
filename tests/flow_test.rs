@@ -1,8 +1,13 @@
 mod common;
-use codediff::flow::{flow_state, init, load_config, set_push_default, FlowKind};
+use codediff::flow::{
+    flow_state, init, latest_tag, load_config, next_actions, set_push_default, start, start_error, FlowKind, FlowState,
+    TagInfo,
+};
 use codediff::CoreError;
 use common::{default_config, flow_repo, TestRepo};
 use git2::BranchType;
+
+use FlowKind::{Feature, Hotfix, Release};
 
 fn repo_with_commit() -> TestRepo {
     let t = TestRepo::new();
@@ -213,4 +218,206 @@ fn push_availability_and_default() {
     assert!(flow_state(&t.repo, true).unwrap().push_default);
     set_push_default(&t.repo, false).unwrap();
     assert!(!flow_state(&t.repo, true).unwrap().push_default);
+}
+
+fn tag(t: &TestRepo, name: &str, target: &str) {
+    let obj = t.repo.revparse_single(target).unwrap();
+    t.repo.tag_lightweight(name, &obj, false).unwrap();
+}
+
+fn add_ref(t: &TestRepo, name: &str, branch: &str) {
+    let id = t.tip(branch);
+    t.repo.reference(name, id, false, "test").unwrap();
+}
+
+#[test]
+fn start_feature_branches_from_develop_and_switches() {
+    let (t, cfg) = flow_repo();
+    start(&t.repo, &cfg, Feature, "login-form").unwrap();
+    assert_eq!(t.head_branch(), "feature/login-form");
+    assert_eq!(t.tip("feature/login-form"), t.tip("develop"));
+}
+
+#[test]
+fn start_hotfix_branches_from_production() {
+    let (t, cfg) = flow_repo();
+    t.commit_file("b.txt", b"two\n", "develop work");
+    assert_ne!(t.tip("develop"), t.tip(&cfg.production));
+    start(&t.repo, &cfg, Hotfix, "1.2.1").unwrap();
+    assert_eq!(t.head_branch(), "hotfix/1.2.1");
+    assert_eq!(t.tip("hotfix/1.2.1"), t.tip(&cfg.production));
+}
+
+#[test]
+fn start_keeps_uncommitted_changes() {
+    let (t, cfg) = flow_repo();
+    t.write("a.txt", b"edited\n");
+    start(&t.repo, &cfg, Feature, "x").unwrap();
+    assert_eq!(t.head_branch(), "feature/x");
+    assert_eq!(t.read("a.txt"), b"edited\n");
+}
+
+#[test]
+fn start_refuses_when_changes_would_be_overwritten() {
+    let (t, cfg) = flow_repo();
+    t.commit_file("a.txt", b"develop version\n", "change a");
+    t.checkout(&cfg.production);
+    t.write("a.txt", b"local edit\n");
+    assert!(matches!(start(&t.repo, &cfg, Feature, "x"), Err(CoreError::CheckoutConflict)));
+    assert!(!t.has_branch("feature/x"));
+    assert_eq!(t.head_branch(), cfg.production);
+}
+
+#[test]
+fn start_error_messages() {
+    let (t, cfg) = flow_repo();
+    t.branch("feature/taken");
+    add_ref(&t, "refs/remotes/origin/feature/remote-only", "develop");
+    tag(&t, "1.0.0", "develop");
+    t.branch("release/1.1.0");
+    let e = |k, n: &str| start_error(&t.repo, &cfg, k, n);
+    assert_eq!(e(Feature, "").as_deref(), Some("Enter a name."));
+    for bad in ["login form", "x/", "/x", "a..b", "a~b"] {
+        assert_eq!(e(Feature, bad).as_deref(), Some("Not a valid branch name."), "{bad}");
+    }
+    assert_eq!(e(Feature, "ok-name"), None);
+    assert_eq!(e(Feature, "taken").as_deref(), Some("feature/taken already exists."));
+    assert_eq!(e(Feature, "remote-only").as_deref(), Some("feature/remote-only already exists on origin."));
+    assert_eq!(e(Release, "1.0.0").as_deref(), Some("Tag 1.0.0 already exists."));
+    assert_eq!(e(Release, "1.2.0").as_deref(), Some("A release is already open: release/1.1.0."));
+    assert_eq!(e(Hotfix, "1.0.0").as_deref(), Some("Tag 1.0.0 already exists."));
+    assert_eq!(e(Hotfix, "1.2.1"), None);
+    t.branch("hotfix/1.0.1");
+    assert_eq!(e(Hotfix, "1.2.1").as_deref(), Some("A hotfix is already open: hotfix/1.0.1."));
+    assert!(matches!(start(&t.repo, &cfg, Feature, "taken"), Err(CoreError::Flow(m)) if m == "feature/taken already exists."));
+}
+
+#[test]
+fn start_error_tag_uses_version_prefix() {
+    let (t, mut cfg) = flow_repo();
+    cfg.version_tag = "v".into();
+    tag(&t, "v1.0.0", "develop");
+    assert_eq!(start_error(&t.repo, &cfg, Release, "1.0.0").as_deref(), Some("Tag v1.0.0 already exists."));
+    assert_eq!(start_error(&t.repo, &cfg, Release, "1.1.0"), None);
+}
+
+/// Repository with commits at fixed times 1000 and 2000 on production, then flow initialized.
+fn timed_flow_repo(version_tag: &str) -> (TestRepo, codediff::flow::FlowConfig) {
+    let t = TestRepo::new();
+    t.write("a.txt", b"one\n");
+    t.stage("a.txt");
+    t.commit_at("c1", 1000);
+    t.write("a.txt", b"two\n");
+    t.stage("a.txt");
+    t.commit_at("c2", 2000);
+    let mut cfg = default_config(&t.head_branch());
+    cfg.version_tag = version_tag.into();
+    (t, cfg)
+}
+
+#[test]
+fn latest_tag_is_newest_reachable_from_production() {
+    let (t, cfg) = timed_flow_repo("");
+    tag(&t, "1.1.0", "HEAD");
+    tag(&t, "1.0.0", "HEAD~1");
+    init(&t.repo, &cfg).unwrap();
+    t.write("b.txt", b"x\n");
+    t.stage("b.txt");
+    t.commit_at("develop only", 3000);
+    tag(&t, "9.9.9", "HEAD");
+    assert_eq!(latest_tag(&t.repo, &cfg).unwrap(), Some(TagInfo { name: "1.1.0".into(), time: 2000 }));
+    // Two tags on the same commit: the higher version wins, compared number by number.
+    t.checkout(&cfg.production);
+    t.write("c.txt", b"y\n");
+    t.stage("c.txt");
+    t.commit_at("c4", 4000);
+    tag(&t, "1.2.0", "HEAD");
+    tag(&t, "1.10.0", "HEAD");
+    assert_eq!(latest_tag(&t.repo, &cfg).unwrap().unwrap().name, "1.10.0");
+}
+
+#[test]
+fn latest_tag_respects_prefix() {
+    let (t, cfg) = timed_flow_repo("v");
+    tag(&t, "v1.0.0", "HEAD~1");
+    tag(&t, "nightly", "HEAD");
+    init(&t.repo, &cfg).unwrap();
+    assert_eq!(latest_tag(&t.repo, &cfg).unwrap().unwrap().name, "v1.0.0");
+}
+
+#[test]
+fn latest_tag_none_without_tags() {
+    let (t, cfg) = flow_repo();
+    assert_eq!(latest_tag(&t.repo, &cfg).unwrap(), None);
+}
+
+#[test]
+fn flow_state_fills_latest_tag_only_when_initialized() {
+    let t = repo_with_commit();
+    tag(&t, "1.0.0", "HEAD");
+    assert_eq!(flow_state(&t.repo, true).unwrap().latest_tag, None);
+    init(&t.repo, &default_config(&t.head_branch())).unwrap();
+    assert_eq!(flow_state(&t.repo, true).unwrap().latest_tag.unwrap().name, "1.0.0");
+}
+
+fn state(current: Option<(FlowKind, &str)>, features: &[&str], releases: &[&str], hotfixes: &[&str]) -> FlowState {
+    let cfg = default_config("main");
+    let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    FlowState {
+        config: Some(cfg.clone()),
+        draft: cfg,
+        init_blocked: None,
+        branches: Vec::new(),
+        features: own(features),
+        releases: own(releases),
+        hotfixes: own(hotfixes),
+        current: current.map(|(k, b)| (k, b.to_string())),
+        latest_tag: None,
+        push_blocked: None,
+        push_default: false,
+    }
+}
+
+fn keys(s: &FlowState) -> Vec<String> {
+    next_actions(s).into_iter().map(|a| a.key).collect()
+}
+
+#[test]
+fn next_actions_by_context() {
+    let mut uninitialized = state(None, &[], &[], &[]);
+    uninitialized.config = None;
+    assert_eq!(keys(&uninitialized), ["init"]);
+    let init_action = &next_actions(&uninitialized)[0];
+    assert_eq!(init_action.name, "Initialize repository");
+    assert_eq!(init_action.detail, "Set up Git Flow branches and prefixes");
+
+    let on_feature = state(Some((Feature, "feature/login-form")), &["feature/login-form"], &[], &[]);
+    assert_eq!(
+        keys(&on_feature),
+        ["finish:feature:feature/login-form", "start:feature", "start:release", "start:hotfix"]
+    );
+    let first = &next_actions(&on_feature)[0];
+    assert_eq!(first.name, "Finish feature login-form");
+    assert_eq!(first.detail, "Merge into develop \u{b7} current branch");
+
+    let on_develop = state(None, &["feature/a"], &["release/1.2.0"], &[]);
+    assert_eq!(keys(&on_develop), ["finish:release:release/1.2.0", "finish:feature", "start:feature", "start:hotfix"]);
+    let rows = next_actions(&on_develop);
+    assert_eq!(rows[0].name, "Finish release 1.2.0");
+    assert_eq!(rows[0].detail, "Merge into main and develop, tag");
+    assert_eq!(rows[1].name, "Finish feature\u{2026}");
+    assert_eq!(rows[1].detail, "Pick a feature to merge into develop");
+    assert_eq!(rows[2].detail, "Branch from develop");
+    assert_eq!(rows[3].name, "Start new hotfix");
+    assert_eq!(rows[3].detail, "Branch from main");
+}
+
+#[test]
+fn next_actions_current_release_and_open_hotfix() {
+    let s = state(Some((Release, "release/2.0.0")), &[], &["release/2.0.0"], &["hotfix/1.0.1"]);
+    assert_eq!(keys(&s), ["finish:release:release/2.0.0", "finish:hotfix:hotfix/1.0.1", "start:feature"]);
+    let rows = next_actions(&s);
+    assert_eq!(rows[0].detail, "Merge into main and develop, tag \u{b7} current branch");
+    assert_eq!(rows[1].name, "Finish hotfix 1.0.1");
+    assert_eq!(rows[1].detail, "Merge into main and develop, tag");
 }

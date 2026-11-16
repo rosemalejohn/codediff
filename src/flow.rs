@@ -3,7 +3,8 @@
 //! initialized with the git-flow command line tools are recognized.
 use crate::branch::{checkout, head_info, HeadInfo};
 use crate::{CoreError, Result};
-use git2::{BranchType, Config, ConfigLevel, ErrorCode, Reference, Repository};
+use git2::{build::CheckoutBuilder, BranchType, Config, ConfigLevel, ErrorClass, ErrorCode, Reference, Repository};
+use std::cmp::Ordering;
 
 const KEY_PRODUCTION: &str = "gitflow.branch.master";
 const KEY_DEVELOP: &str = "gitflow.branch.develop";
@@ -201,6 +202,11 @@ pub fn flow_state(repo: &Repository, git_found: bool) -> Result<FlowState> {
         }
     }
 
+    let latest_tag = match &config {
+        Some(cfg) => latest_tag(repo, cfg)?,
+        None => None,
+    };
+
     let push_blocked = if repo.find_remote("origin").is_err() {
         Some("No origin remote.".to_string())
     } else if !git_found {
@@ -219,7 +225,7 @@ pub fn flow_state(repo: &Repository, git_found: bool) -> Result<FlowState> {
         releases,
         hotfixes,
         current,
-        latest_tag: None,
+        latest_tag,
         push_blocked,
         push_default,
     })
@@ -280,4 +286,158 @@ pub fn init(repo: &Repository, cfg: &FlowConfig) -> Result<()> {
 pub fn set_push_default(repo: &Repository, on: bool) -> Result<()> {
     repo.config()?.open_level(ConfigLevel::Local)?.set_bool(KEY_PUSH_DEFAULT, on)?;
     Ok(())
+}
+
+/// Why this start is refused, or None when it can run.
+pub fn start_error(repo: &Repository, cfg: &FlowConfig, kind: FlowKind, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("Enter a name.".into());
+    }
+    let branch = format!("{}{}", cfg.prefix(kind), name);
+    if name.contains(char::is_whitespace)
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || !matches!(git2::Branch::name_is_valid(&branch), Ok(true))
+    {
+        return Some("Not a valid branch name.".into());
+    }
+    if has_branch(repo, &branch) {
+        return Some(format!("{branch} already exists."));
+    }
+    if repo.find_reference(&format!("refs/remotes/origin/{branch}")).is_ok() {
+        return Some(format!("{branch} already exists on origin."));
+    }
+    let (label, open) = match kind {
+        FlowKind::Feature => return None,
+        FlowKind::Release => ("release", &cfg.release),
+        FlowKind::Hotfix => ("hotfix", &cfg.hotfix),
+    };
+    let tag = format!("{}{}", cfg.version_tag, name);
+    if repo.find_reference(&format!("refs/tags/{tag}")).is_ok() {
+        return Some(format!("Tag {tag} already exists."));
+    }
+    let open_branch = branches_with_prefix(repo, open).ok()?.into_iter().next()?;
+    Some(format!("A {label} is already open: {open_branch}."))
+}
+
+/// Creates `prefix + name` from the base branch of `kind` and switches to it.
+/// Like `branch::checkout`: a safe tree checkout first, so a refusal leaves
+/// everything untouched, then the branch, then HEAD.
+pub fn start(repo: &Repository, cfg: &FlowConfig, kind: FlowKind, name: &str) -> Result<()> {
+    if let Some(msg) = start_error(repo, cfg, kind, name) {
+        return Err(CoreError::Flow(msg));
+    }
+    let branch = format!("{}{}", cfg.prefix(kind), name);
+    let base = repo.find_branch(cfg.base(kind), BranchType::Local)?;
+    let commit = base.get().peel_to_commit()?;
+    repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().safe())).map_err(|e| {
+        if e.class() == ErrorClass::Checkout && e.code() == ErrorCode::Conflict {
+            CoreError::CheckoutConflict
+        } else {
+            e.into()
+        }
+    })?;
+    repo.branch(&branch, &commit, false)?;
+    repo.set_head(&format!("refs/heads/{branch}"))?;
+    Ok(())
+}
+
+/// Compares dotted versions number by number; non-numeric parts compare as text.
+fn compare_versions(a: &str, b: &str) -> Ordering {
+    let mut left = a.split('.');
+    let mut right = b.split('.');
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    _ => x.cmp(y),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
+/// The newest tag with the version tag prefix whose commit is the production
+/// tip or one of its ancestors.
+pub fn latest_tag(repo: &Repository, cfg: &FlowConfig) -> Result<Option<TagInfo>> {
+    let tip = repo.find_branch(&cfg.production, BranchType::Local)?.get().peel_to_commit()?.id();
+    let mut best: Option<TagInfo> = None;
+    for name in repo.tag_names(None)?.iter().flatten().flatten() {
+        if !name.starts_with(&cfg.version_tag) {
+            continue;
+        }
+        let Ok(commit) = repo.find_reference(&format!("refs/tags/{name}")).and_then(|r| r.peel_to_commit()) else {
+            continue;
+        };
+        if commit.id() != tip && !repo.graph_descendant_of(tip, commit.id())? {
+            continue;
+        }
+        let time = commit.time().seconds();
+        let better = match &best {
+            None => true,
+            Some(b) => time.cmp(&b.time).then_with(|| compare_versions(name, &b.name)) == Ordering::Greater,
+        };
+        if better {
+            best = Some(TagInfo { name: name.to_string(), time });
+        }
+    }
+    Ok(best)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowAction {
+    pub key: String,
+    pub name: String,
+    pub detail: String,
+}
+
+fn action(key: impl Into<String>, name: impl Into<String>, detail: impl Into<String>) -> FlowAction {
+    FlowAction { key: key.into(), name: name.into(), detail: detail.into() }
+}
+
+fn finish_action(cfg: &FlowConfig, kind: FlowKind, branch: &str, current: bool) -> FlowAction {
+    let (word, key, detail) = match kind {
+        FlowKind::Feature => ("feature", "feature", format!("Merge into {}", cfg.develop)),
+        FlowKind::Release => ("release", "release", format!("Merge into {} and {}, tag", cfg.production, cfg.develop)),
+        FlowKind::Hotfix => ("hotfix", "hotfix", format!("Merge into {} and {}, tag", cfg.production, cfg.develop)),
+    };
+    let short = branch.strip_prefix(cfg.prefix(kind)).unwrap_or(branch);
+    let detail = if current { format!("{detail} \u{b7} current branch") } else { detail };
+    action(format!("finish:{key}:{branch}"), format!("Finish {word} {short}"), detail)
+}
+
+/// The rows of the Git Flow actions list, most relevant first.
+pub fn next_actions(state: &FlowState) -> Vec<FlowAction> {
+    let Some(cfg) = &state.config else {
+        return vec![action("init", "Initialize repository", "Set up Git Flow branches and prefixes")];
+    };
+    let mut rows = Vec::new();
+    let current_branch = state.current.as_ref().map(|(_, b)| b.as_str());
+    if let Some((kind, branch)) = &state.current {
+        rows.push(finish_action(cfg, *kind, branch, true));
+    }
+    for (kind, open) in [(FlowKind::Release, &state.releases), (FlowKind::Hotfix, &state.hotfixes)] {
+        if let Some(branch) = open.first().filter(|b| Some(b.as_str()) != current_branch) {
+            rows.push(finish_action(cfg, kind, branch, false));
+        }
+    }
+    let on_feature = matches!(state.current, Some((FlowKind::Feature, _)));
+    if !state.features.is_empty() && !on_feature {
+        rows.push(action("finish:feature", "Finish feature\u{2026}", format!("Pick a feature to merge into {}", cfg.develop)));
+    }
+    rows.push(action("start:feature", "Start new feature", format!("Branch from {}", cfg.develop)));
+    if state.releases.is_empty() {
+        rows.push(action("start:release", "Start new release", format!("Branch from {}", cfg.develop)));
+    }
+    if state.hotfixes.is_empty() {
+        rows.push(action("start:hotfix", "Start new hotfix", format!("Branch from {}", cfg.production)));
+    }
+    rows
 }
