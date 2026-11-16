@@ -1,6 +1,7 @@
 mod common;
-use codediff::flow::FlowConfig;
-use codediff::flow_finish::{plan_finish, Blocker, FinishPlan};
+use codediff::flow::{FlowConfig, FlowKind};
+use codediff::flow_finish::{finish, plan_finish, Blocker, FinishPlan, FinishRequest, PushSpec};
+use codediff::CoreError;
 use codediff::status::list_status;
 use common::{feature_req, flow_repo, release_req, TestRepo};
 use git2::{Oid, Repository, WorktreeAddOptions};
@@ -394,4 +395,266 @@ fn untracked_file_where_a_directory_is_needed_blocks() {
 
     let p = plan_finish(&t.repo, &cfg, &feature_req("feature/x")).unwrap();
     assert_eq!(p.blocker, Some(Blocker::Collision(vec!["docs".into()])));
+}
+
+fn hotfix_req(branch: &str, tag: &str, message: &str) -> FinishRequest {
+    FinishRequest { kind: FlowKind::Hotfix, ..release_req(branch, tag, message) }
+}
+
+fn parents(t: &TestRepo, id: Oid) -> Vec<Oid> {
+    t.repo.find_commit(id).unwrap().parent_ids().collect()
+}
+
+#[test]
+fn finish_feature_creates_merge_commit() {
+    let (t, cfg) = on_branch("feature/login-form");
+    let feature_tip = t.commit_file("feature-file.txt", b"feature\n", "add feature file");
+    t.checkout("develop");
+    let old_develop = t.commit_file("develop-file.txt", b"develop\n", "develop moves on");
+    t.checkout("feature/login-form");
+
+    let out = finish(&t.repo, &cfg, &feature_req("feature/login-form")).unwrap();
+    let tip = t.repo.find_commit(t.tip("develop")).unwrap();
+    assert_eq!(tip.parent_ids().collect::<Vec<_>>(), [old_develop, feature_tip]);
+    assert_eq!(tip.message().unwrap(), "Merge branch 'feature/login-form' into develop");
+    assert_eq!(t.head_branch(), "develop");
+    assert!(!t.has_branch("feature/login-form"));
+    assert!(t.exists("feature-file.txt"));
+    assert!(t.exists("develop-file.txt"));
+    assert_eq!(out.notice, "Finished feature/login-form. Merged into develop and deleted the branch.");
+    assert_eq!(out.pushed_notice, "");
+    assert_eq!(out.push, None);
+}
+
+#[test]
+fn finish_single_commit_feature_fast_forwards() {
+    let (t, cfg) = on_branch("feature/x");
+    let feature_tip = t.commit_file("feature-file.txt", b"feature\n", "add feature file");
+
+    finish(&t.repo, &cfg, &feature_req("feature/x")).unwrap();
+    assert_eq!(t.tip("develop"), feature_tip);
+    assert_eq!(t.head_branch(), "develop");
+    assert!(!t.has_branch("feature/x"));
+    assert!(t.exists("feature-file.txt"));
+}
+
+#[test]
+fn finish_feature_already_merged_just_deletes() {
+    let (t, cfg) = on_branch("feature/x");
+    let feature_tip = t.commit_file("feature-file.txt", b"feature\n", "add feature file");
+    set_ref(&t.repo, "refs/heads/develop", feature_tip);
+    let old_develop = t.tip("develop");
+
+    let out = finish(&t.repo, &cfg, &feature_req("feature/x")).unwrap();
+    assert_eq!(t.tip("develop"), old_develop);
+    assert!(!t.has_branch("feature/x"));
+    assert_eq!(t.head_branch(), "develop");
+    assert_eq!(out.notice, "Finished feature/x. Merged into develop and deleted the branch.");
+}
+
+#[test]
+fn finish_keeps_branch_when_delete_unticked() {
+    let (t, cfg) = on_branch("feature/x");
+    let feature_tip = t.commit_file("feature-file.txt", b"feature\n", "add feature file");
+    let mut req = feature_req("feature/x");
+    req.delete_branch = false;
+
+    let out = finish(&t.repo, &cfg, &req).unwrap();
+    assert!(t.has_branch("feature/x"));
+    assert_eq!(t.tip("feature/x"), feature_tip);
+    assert_eq!(t.head_branch(), "develop");
+    assert_eq!(out.notice, "Finished feature/x. Merged into develop.");
+    assert_eq!(out.push, None);
+}
+
+#[test]
+fn finish_feature_while_on_develop_updates_worktree() {
+    let (t, cfg) = on_branch("feature/x");
+    let old_develop = t.tip("develop");
+    t.commit_file("feature-file.txt", b"feature\n", "one");
+    let feature_tip = t.commit_file("feature-file.txt", b"feature\nmore\n", "two");
+    t.checkout("develop");
+    assert!(!t.exists("feature-file.txt"));
+
+    finish(&t.repo, &cfg, &feature_req("feature/x")).unwrap();
+    assert_eq!(parents(&t, t.tip("develop")), [old_develop, feature_tip]);
+    assert!(t.exists("feature-file.txt"));
+    assert_eq!(t.read("feature-file.txt"), b"feature\nmore\n");
+    let s = list_status(&t.repo).unwrap();
+    assert!(s.staged.is_empty() && s.unstaged.is_empty());
+}
+
+#[test]
+fn finish_release_graph() {
+    let (t, cfg) = release_repo();
+    let old_prod = t.tip(&cfg.production);
+    let old_develop = t.tip("develop");
+    let release_tip = t.tip("release/1.2.0");
+
+    let out = finish(&t.repo, &cfg, &release_req("release/1.2.0", "1.2.0", "Release 1.2.0")).unwrap();
+    let prod = t.repo.find_commit(t.tip(&cfg.production)).unwrap();
+    assert_eq!(prod.parent_ids().collect::<Vec<_>>(), [old_prod, release_tip]);
+    assert_eq!(prod.message().unwrap(), format!("Merge branch 'release/1.2.0' into {}", cfg.production));
+    let tag = t.repo.find_reference("refs/tags/1.2.0").unwrap().peel_to_tag().unwrap();
+    assert_eq!((tag.target_id(), tag.message().unwrap().unwrap().trim()), (prod.id(), "Release 1.2.0"));
+    let dev = t.repo.find_commit(t.tip("develop")).unwrap();
+    assert_eq!(dev.parent_ids().collect::<Vec<_>>(), [old_develop, prod.id()]);
+    assert_eq!(dev.message().unwrap(), "Merge tag '1.2.0' into develop");
+    assert_eq!(t.head_branch(), "develop");
+    assert!(!t.has_branch("release/1.2.0"));
+    assert_eq!(t.read("version.txt"), b"1.2.0\n");
+    assert_eq!(out.notice, "Finished release/1.2.0. Tagged 1.2.0. Not pushed.");
+    assert_eq!(out.pushed_notice, "");
+    assert_eq!(out.push, None);
+}
+
+#[test]
+fn finish_hotfix_merges_into_production_and_develop() {
+    let (t, cfg) = flow_repo();
+    t.checkout(&cfg.production);
+    t.branch("hotfix/1.2.1");
+    t.checkout("hotfix/1.2.1");
+    let hotfix_tip = t.commit_file("fix.txt", b"fix\n", "fix the bug");
+    t.checkout("develop");
+    let old_develop = t.commit_file("develop-file.txt", b"develop\n", "develop moves on");
+    t.checkout("hotfix/1.2.1");
+    let old_prod = t.tip(&cfg.production);
+
+    let out = finish(&t.repo, &cfg, &hotfix_req("hotfix/1.2.1", "1.2.1", "Hotfix 1.2.1")).unwrap();
+    let prod = t.repo.find_commit(t.tip(&cfg.production)).unwrap();
+    assert_eq!(prod.parent_ids().collect::<Vec<_>>(), [old_prod, hotfix_tip]);
+    assert_eq!(prod.message().unwrap(), format!("Merge branch 'hotfix/1.2.1' into {}", cfg.production));
+    let tag = t.repo.find_reference("refs/tags/1.2.1").unwrap().peel_to_tag().unwrap();
+    assert_eq!((tag.target_id(), tag.message().unwrap().unwrap().trim()), (prod.id(), "Hotfix 1.2.1"));
+    let dev = t.repo.find_commit(t.tip("develop")).unwrap();
+    assert_eq!(dev.parent_ids().collect::<Vec<_>>(), [old_develop, prod.id()]);
+    assert_eq!(dev.message().unwrap(), "Merge tag '1.2.1' into develop");
+    assert_eq!(t.head_branch(), "develop");
+    assert!(!t.has_branch("hotfix/1.2.1"));
+    assert!(t.exists("fix.txt") && t.exists("develop-file.txt"));
+    let s = list_status(&t.repo).unwrap();
+    assert!(s.staged.is_empty() && s.unstaged.is_empty());
+    assert_eq!(out.notice, "Finished hotfix/1.2.1. Tagged 1.2.1. Not pushed.");
+}
+
+#[test]
+fn finish_with_push_returns_spec() {
+    let (t, cfg) = release_repo();
+    let release_tip = t.tip("release/1.2.0");
+    set_ref(&t.repo, "refs/remotes/origin/release/1.2.0", release_tip);
+    let mut req = release_req("release/1.2.0", "1.2.0", "Release 1.2.0");
+    req.push = true;
+
+    let out = finish(&t.repo, &cfg, &req).unwrap();
+    assert_eq!(
+        out.push,
+        Some(PushSpec {
+            branches: vec![cfg.production.clone(), "develop".into()],
+            tag: "1.2.0".into(),
+            delete: Some(("release/1.2.0".into(), release_tip)),
+        })
+    );
+    assert_eq!(
+        out.pushed_notice,
+        format!("Finished release/1.2.0. Tagged 1.2.0 and pushed {}, develop and the tag to origin.", cfg.production)
+    );
+    assert_eq!(out.notice, "Finished release/1.2.0. Tagged 1.2.0. Not pushed.");
+
+    // Not on origin: nothing to delete there.
+    let (t, cfg) = release_repo();
+    let out = finish(&t.repo, &cfg, &req).unwrap();
+    assert_eq!(out.push.unwrap().delete, None);
+
+    // On origin, but the branch is kept.
+    let (t, cfg) = release_repo();
+    set_ref(&t.repo, "refs/remotes/origin/release/1.2.0", t.tip("release/1.2.0"));
+    req.delete_branch = false;
+    let out = finish(&t.repo, &cfg, &req).unwrap();
+    assert_eq!(out.push.unwrap().delete, None);
+    assert!(t.has_branch("release/1.2.0"));
+}
+
+#[test]
+fn finish_refuses_when_blocked_and_changes_nothing() {
+    let (t, cfg) = on_branch("feature/x");
+    t.commit_file("feature-file.txt", b"feature\n", "one");
+    t.write("a.txt", b"dirty\n");
+    let req = feature_req("feature/x");
+
+    let before = snapshot(&t);
+    let err = finish(&t.repo, &cfg, &req);
+    assert!(matches!(err, Err(CoreError::Flow(ref m)) if m.starts_with("1 uncommitted change")));
+    if let Err(CoreError::Flow(m)) = err {
+        assert_eq!(
+            m,
+            "1 uncommitted change. Finish needs a clean working tree. \
+             Commit them, or discard them in Changes, then try again."
+        );
+    }
+    assert_eq!(snapshot(&t), before);
+    assert_eq!(t.read("a.txt"), b"dirty\n");
+}
+
+#[test]
+fn finish_conflict_changes_nothing() {
+    let (t, cfg) = on_branch("release/1.2.0");
+    t.commit_file("a.txt", b"release a\n", "release edit");
+    t.checkout("develop");
+    t.commit_file("a.txt", b"develop a\n", "develop edit");
+    t.checkout("release/1.2.0");
+
+    let before = snapshot(&t);
+    let err = finish(&t.repo, &cfg, &release_req("release/1.2.0", "1.2.0", "Release 1.2.0"));
+    assert!(matches!(err, Err(CoreError::Flow(ref m)) if m.starts_with("Cannot merge cleanly")));
+    assert_eq!(snapshot(&t), before);
+    assert!(t.repo.find_reference("refs/tags/1.2.0").is_err());
+    assert_eq!(t.read("a.txt"), b"release a\n");
+    assert!(!t.repo.path().join("MERGE_HEAD").exists());
+}
+
+/// The checkout runs before any reference moves: when it fails for a reason
+/// the planner cannot see (here the working directory is read-only), the
+/// references, HEAD, the index and the working tree are all unchanged.
+#[test]
+fn finish_checkout_failure_moves_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let (t, cfg) = on_branch("feature/x");
+    t.commit_file("feature-file.txt", b"feature\n", "add feature file");
+    t.checkout("develop");
+    t.commit_file("develop-file.txt", b"develop\n", "develop moves on");
+    t.checkout("feature/x");
+    assert_eq!(plan_finish(&t.repo, &cfg, &feature_req("feature/x")).unwrap().blocker, None);
+
+    let before = snapshot(&t);
+    let set_mode = |mode| std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+    set_mode(0o555);
+    let result = finish(&t.repo, &cfg, &feature_req("feature/x"));
+    set_mode(0o755);
+
+    assert!(result.is_err());
+    assert_eq!(snapshot(&t), before);
+    assert_eq!(t.head_branch(), "feature/x");
+    assert!(!t.exists("develop-file.txt"));
+    assert_eq!(t.index_blob("develop-file.txt"), None);
+}
+
+/// A reference move that fails names the step that stopped and what already ran.
+#[test]
+fn finish_names_the_step_that_stopped() {
+    let (t, cfg) = on_branch("feature/x");
+    let feature_tip = t.commit_file("feature-file.txt", b"feature\n", "add feature file");
+    let lock = t.repo.path().join("refs/heads/feature/x.lock");
+    std::fs::write(&lock, b"").unwrap();
+
+    let err = finish(&t.repo, &cfg, &feature_req("feature/x"));
+    std::fs::remove_file(&lock).unwrap();
+
+    assert!(matches!(
+        err,
+        Err(CoreError::Flow(ref m)) if m == "Finish stopped at: Delete feature/x. \
+            Already done: Merge feature/x into develop, Switch to develop."
+    ));
+    assert_eq!(t.tip("develop"), feature_tip);
+    assert_eq!(t.head_branch(), "develop");
+    assert!(t.has_branch("feature/x"));
 }

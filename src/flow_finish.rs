@@ -5,8 +5,9 @@
 use crate::flow::{FlowConfig, FlowKind};
 use crate::model::FileStatus;
 use crate::status::list_status;
-use crate::Result;
-use git2::{BranchType, Delta, Oid, Reference, Repository, RepositoryState};
+use crate::{CoreError, Result};
+use git2::build::CheckoutBuilder;
+use git2::{BranchType, Delta, ErrorClass, ErrorCode, Oid, Reference, Repository, RepositoryState};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -89,6 +90,25 @@ pub struct FinishPlan {
     pub blocker: Option<Blocker>,
 }
 
+/// What a release or hotfix finish hands to the push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushSpec {
+    /// Production, then develop.
+    pub branches: Vec<String>,
+    pub tag: String,
+    /// Remote branch to delete and the tip it must still have.
+    pub delete: Option<(String, Oid)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishOutcome {
+    /// Shown when nothing is pushed.
+    pub notice: String,
+    /// Shown after a successful push; empty when `push` is None.
+    pub pushed_notice: String,
+    pub push: Option<PushSpec>,
+}
+
 /// One merge computed in memory.
 pub(crate) enum Merge {
     /// The target already contains the source.
@@ -101,7 +121,7 @@ pub(crate) enum Merge {
 
 /// Merges `source` into `target` in memory. Writes at most a tree object.
 pub(crate) fn test_merge(repo: &Repository, target: Oid, source: Oid) -> Result<Merge> {
-    if target == source || repo.graph_descendant_of(target, source)? {
+    if contains(repo, target, source)? {
         return Ok(Merge::AlreadyMerged);
     }
     let mut index = repo.merge_commits(&repo.find_commit(target)?, &repo.find_commit(source)?, None)?;
@@ -118,6 +138,11 @@ pub(crate) fn test_merge(repo: &Repository, target: Oid, source: Oid) -> Result<
     Ok(Merge::Clean(index.write_tree_to(repo)?))
 }
 
+/// `target` is `source` or has it in its history.
+fn contains(repo: &Repository, target: Oid, source: Oid) -> Result<bool> {
+    Ok(target == source || repo.graph_descendant_of(target, source)?)
+}
+
 pub(crate) fn merge_message(source: &str, target: &str) -> String {
     format!("Merge branch '{source}' into {target}")
 }
@@ -128,7 +153,6 @@ pub(crate) enum Simulation {
         /// The new production tip for a release or hotfix: an unreferenced
         /// merge commit, or the current tip when it already contains the
         /// branch. None for a feature. Read by the executing finish.
-        #[allow(dead_code)]
         production: Option<Oid>,
         /// The tree develop would have after the finish.
         develop_tree: Oid,
@@ -349,4 +373,123 @@ fn find_blocker(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Res
 /// Changes no reference, HEAD, index or working tree.
 pub fn plan_finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Result<FinishPlan> {
     Ok(FinishPlan { steps: steps(repo, cfg, req)?, blocker: find_blocker(repo, cfg, req)? })
+}
+
+fn blocked(b: &Blocker) -> CoreError {
+    CoreError::Flow(format!("{}. {}", b.title(), b.body()))
+}
+
+/// Moves `refs/heads/{branch}` from `from` to `to`, refusing if it moved meanwhile.
+fn move_branch(repo: &Repository, branch: &str, from: Oid, to: Oid) -> Result<()> {
+    if from != to {
+        repo.reference_matching(&format!("refs/heads/{branch}"), to, true, from, "flow finish")?;
+    }
+    Ok(())
+}
+
+/// One reference change of a finish, labelled with its plan step text.
+type Move<'a> = (String, Box<dyn FnOnce() -> Result<()> + 'a>);
+
+/// Runs the finish. In order: plan and refuse on a blocker; write every new
+/// commit unreferenced; check out develop's new tip while HEAD still points
+/// at the old commit; then move the references. Until that last stage an
+/// error leaves every reference, HEAD and the working tree as they were.
+pub fn finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Result<FinishOutcome> {
+    if let Some(b) = plan_finish(repo, cfg, req)?.blocker {
+        return Err(blocked(&b));
+    }
+    let b = &req.branch;
+    let feature = req.kind == FlowKind::Feature;
+    let branch_tip = tip(repo, b)?;
+    let develop_tip = tip(repo, &cfg.develop)?;
+    let production_tip = if feature { None } else { Some(tip(repo, &cfg.production)?) };
+    let delete_on_origin = !feature
+        && req.push
+        && req.delete_branch
+        && repo.find_reference(&format!("refs/remotes/origin/{b}")).is_ok();
+
+    // New commits, referenced by nothing yet.
+    let (production, develop_tree) = match simulate(repo, cfg, req)? {
+        Simulation::Clean { production, develop_tree } => (production, develop_tree),
+        Simulation::Conflict { target, files } => {
+            return Err(blocked(&Blocker::Conflict { target, branch: b.clone(), files }));
+        }
+    };
+    let sig = repo.signature()?;
+    let merge_commit = |message: &str, parents: [Oid; 2]| -> Result<Oid> {
+        let parents = [&repo.find_commit(parents[0])?, &repo.find_commit(parents[1])?];
+        Ok(repo.commit(None, &sig, &sig, message, &repo.find_tree(develop_tree)?, &parents)?)
+    };
+    let new_develop = match production {
+        None if contains(repo, develop_tip, branch_tip)? => develop_tip,
+        None if repo.graph_ahead_behind(branch_tip, develop_tip)? == (1, 0) => branch_tip,
+        None => merge_commit(&merge_message(b, &cfg.develop), [develop_tip, branch_tip])?,
+        Some(new_production) if contains(repo, develop_tip, new_production)? => develop_tip,
+        Some(new_production) => {
+            let message = format!("Merge tag '{}' into {}", req.tag, cfg.develop);
+            merge_commit(&message, [develop_tip, new_production])?
+        }
+    };
+
+    // Safe checkout while HEAD still points at the old commit.
+    let develop_commit = repo.find_commit(new_develop)?;
+    repo.checkout_tree(develop_commit.as_object(), Some(CheckoutBuilder::new().safe()))
+        .map_err(|e| {
+            if e.class() == ErrorClass::Checkout && e.code() == ErrorCode::Conflict {
+                CoreError::CheckoutConflict
+            } else {
+                e.into()
+            }
+        })?;
+
+    let mut moves: Vec<Move> = Vec::new();
+    if let (Some(new), Some(old)) = (production, production_tip) {
+        let prod = &cfg.production;
+        moves.push((format!("Merge {b} into {prod}"), Box::new(move || move_branch(repo, prod, old, new))));
+        let tag = move || {
+            repo.tag(&req.tag, &repo.find_object(new, None)?, &sig, &req.message, false)?;
+            Ok(())
+        };
+        moves.push((format!("Tag {prod} as {}", req.tag), Box::new(tag)));
+    }
+    let develop = &cfg.develop;
+    let develop_text = if feature { format!("Merge {b} into {develop}") } else { format!("Merge {b} back into {develop}") };
+    moves.push((develop_text, Box::new(move || move_branch(repo, develop, develop_tip, new_develop))));
+    let switch = move || Ok(repo.set_head(&format!("refs/heads/{develop}"))?);
+    moves.push((format!("Switch to {develop}"), Box::new(switch)));
+    if req.delete_branch {
+        let delete = move || Ok(repo.find_branch(b, BranchType::Local)?.delete()?);
+        moves.push((format!("Delete {b}"), Box::new(delete)));
+    }
+
+    let mut done: Vec<String> = Vec::new();
+    for (text, run) in moves {
+        if run().is_err() {
+            let done = if done.is_empty() { "nothing".to_string() } else { done.join(", ") };
+            return Err(CoreError::Flow(format!("Finish stopped at: {text}. Already done: {done}.")));
+        }
+        done.push(text);
+    }
+
+    if feature {
+        let notice = if req.delete_branch {
+            format!("Finished {b}. Merged into {develop} and deleted the branch.")
+        } else {
+            format!("Finished {b}. Merged into {develop}.")
+        };
+        return Ok(FinishOutcome { notice, pushed_notice: String::new(), push: None });
+    }
+    let push = req.push.then(|| PushSpec {
+        branches: vec![cfg.production.clone(), develop.clone()],
+        tag: req.tag.clone(),
+        delete: delete_on_origin.then(|| (b.clone(), branch_tip)),
+    });
+    let pushed_notice = match push {
+        Some(_) => format!(
+            "Finished {b}. Tagged {} and pushed {}, {develop} and the tag to origin.",
+            req.tag, cfg.production
+        ),
+        None => String::new(),
+    };
+    Ok(FinishOutcome { notice: format!("Finished {b}. Tagged {}. Not pushed.", req.tag), pushed_notice, push })
 }
