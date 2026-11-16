@@ -8,6 +8,7 @@ pub mod flow_finish;
 pub mod highlight;
 pub mod history;
 pub mod model;
+pub mod push;
 pub mod recent;
 pub mod repo;
 pub mod sbs;

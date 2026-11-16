@@ -169,3 +169,38 @@ pub fn release_req(branch: &str, tag: &str, message: &str) -> FinishRequest {
         push: false,
     }
 }
+
+/// Run the real `git` in `dir` with a fixed identity; panics unless it succeeds.
+pub fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .output()
+        .expect("git must be installed");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A `flow_repo` with a bare repository as `origin` (the returned `TempDir`),
+/// production and develop already pushed to it.
+pub fn with_origin() -> (TestRepo, FlowConfig, TempDir) {
+    let (t, cfg) = flow_repo();
+    let bare = tempfile::tempdir().unwrap();
+    git(bare.path(), &["init", "--bare"]);
+    t.repo.remote("origin", bare.path().to_str().unwrap()).unwrap();
+    git(t.path(), &["push", "origin", &cfg.production, "develop"]);
+    (t, cfg, bare)
+}
+
+/// Target of `name` (a full reference name) in the bare repository.
+pub fn origin_ref(bare: &TempDir, name: &str) -> Option<Oid> {
+    let repo = Repository::open_bare(bare.path()).unwrap();
+    let id = repo.find_reference(name).ok()?.target();
+    id
+}
