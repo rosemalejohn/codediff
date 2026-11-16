@@ -110,8 +110,9 @@ fn rejected_push_changes_nothing_on_origin() {
     let before = refs(&bare);
     let err = push(&git_bin(), t.path(), &spec).unwrap_err();
     assert!(!err.is_empty());
-    assert!(err.contains(&prod), "{err}");
-    assert!(!err.contains("hint:"), "{err}");
+    assert!(err.starts_with(&prod), "{err}");
+    assert!(err.contains("[rejected]"), "{err}");
+    assert!(!err.contains("error:") && !err.contains("hint:"), "{err}");
     assert_eq!(refs(&bare), before);
     assert_eq!(origin_ref(&bare, "refs/tags/1.2.0"), None);
     assert_eq!(t.head_branch(), "develop");
@@ -132,7 +133,7 @@ fn delete_refused_when_origin_branch_moved() {
     let develop_before = origin_ref(&bare, "refs/heads/develop");
     let spec = spec_for(&t, &cfg);
     let err = push(&git_bin(), t.path(), &spec).unwrap_err();
-    assert!(!err.is_empty());
+    assert!(err.contains("release/1.2.0") && err.contains("stale info"), "{err}");
     assert_eq!(origin_ref(&bare, "refs/heads/develop"), develop_before);
     assert_eq!(origin_ref(&bare, "refs/tags/1.2.0"), None);
     assert!(origin_ref(&bare, "refs/heads/release/1.2.0").is_some());
@@ -142,5 +143,6 @@ fn delete_refused_when_origin_branch_moved() {
 fn push_without_origin_fails() {
     let (t, cfg) = flow_repo();
     let spec = PushSpec { branches: vec![cfg.production.clone(), "develop".into()], tag: "1.2.0".into(), delete: None };
-    assert!(push(&git_bin(), t.path(), &spec).is_err());
+    let err = push(&git_bin(), t.path(), &spec).unwrap_err();
+    assert!(!err.is_empty() && !err.contains("hint:"), "{err}");
 }

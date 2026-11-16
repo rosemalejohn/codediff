@@ -91,8 +91,8 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<S
     })
 }
 
-/// The rejected references from `--porcelain` stdout plus the tail of stderr,
-/// without the generic `hint:` lines.
+/// The rejected references from `--porcelain` stdout; only when there are none,
+/// the tail of stderr without the generic `hint:` lines.
 fn failure_reason(stdout: &str, stderr: &str) -> String {
     let rejected: Vec<(String, bool)> = stdout
         .lines()
@@ -114,13 +114,16 @@ fn failure_reason(stdout: &str, stderr: &str) -> String {
     if shown.is_empty() {
         shown = rejected.iter().map(|(s, _)| s.as_str()).collect();
     }
-    let lines: Vec<&str> = stderr
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("hint:"))
-        .collect();
-    let tail = lines[lines.len().saturating_sub(3)..].join(" ");
-    let reason = format!("{} {}", shown.join("; "), tail).trim().to_string();
+    let reason = if shown.is_empty() {
+        let lines: Vec<&str> = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("hint:"))
+            .collect();
+        lines[lines.len().saturating_sub(3)..].join(" ")
+    } else {
+        shown.join("; ")
+    };
     if reason.is_empty() {
         "git push failed.".into()
     } else {
