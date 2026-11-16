@@ -13,6 +13,8 @@ pub enum CoreError {
     #[error("Your local changes would be overwritten. Commit or discard them first.")]
     CheckoutConflict,
     #[error("{0}")]
+    Flow(String),
+    #[error("{0}")]
     Json(#[from] serde_json::Error),
 }
 

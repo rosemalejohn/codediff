@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use codediff::flow::{init, FlowConfig};
 use git2::{Oid, Repository};
 use std::path::Path;
 use tempfile::TempDir;
@@ -76,4 +77,70 @@ impl TestRepo {
             .commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
             .unwrap()
     }
+
+    /// Like `commit`, with an explicit author and committer time in unix seconds.
+    pub fn commit_at(&self, msg: &str, secs: i64) -> Oid {
+        let mut idx = self.repo.index().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = self.repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::new("Test", "test@example.com", &git2::Time::new(secs, 0)).unwrap();
+        let parent = self.repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        self.repo
+            .commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap()
+    }
+
+    /// Write, stage and commit one file.
+    pub fn commit_file(&self, rel: &str, contents: &[u8], msg: &str) -> Oid {
+        self.write(rel, contents);
+        self.stage(rel);
+        self.commit(msg)
+    }
+
+    /// New branch at HEAD, not checked out.
+    pub fn branch(&self, name: &str) {
+        let head = self.repo.head().unwrap().peel_to_commit().unwrap();
+        self.repo.branch(name, &head, false).unwrap();
+    }
+
+    pub fn checkout(&self, name: &str) {
+        codediff::branch::checkout(&self.repo, &format!("refs/heads/{name}")).unwrap();
+    }
+
+    pub fn tip(&self, name: &str) -> Oid {
+        self.repo.find_reference(&format!("refs/heads/{name}")).unwrap().target().unwrap()
+    }
+
+    pub fn head_branch(&self) -> String {
+        match codediff::branch::head_info(&self.repo).unwrap() {
+            codediff::branch::HeadInfo::Branch(b) => b,
+            codediff::branch::HeadInfo::Detached(id) => panic!("detached at {id}"),
+        }
+    }
+
+    pub fn has_branch(&self, name: &str) -> bool {
+        self.repo.find_branch(name, git2::BranchType::Local).is_ok()
+    }
+}
+
+/// Default Git Flow settings with `production` as the production branch.
+pub fn default_config(production: &str) -> FlowConfig {
+    FlowConfig {
+        production: production.into(),
+        develop: "develop".into(),
+        feature: "feature/".into(),
+        release: "release/".into(),
+        hotfix: "hotfix/".into(),
+        version_tag: String::new(),
+    }
+}
+
+/// One commit on the initial branch, Git Flow initialized with defaults, HEAD on develop.
+pub fn flow_repo() -> (TestRepo, FlowConfig) {
+    let t = TestRepo::new();
+    t.commit_file("a.txt", b"one\n", "first");
+    let cfg = default_config(&t.head_branch());
+    init(&t.repo, &cfg).unwrap();
+    (t, cfg)
 }

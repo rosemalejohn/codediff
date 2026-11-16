@@ -3,6 +3,7 @@ pub mod branch;
 pub mod controller;
 pub mod diff;
 pub mod error;
+pub mod flow;
 pub mod highlight;
 pub mod history;
 pub mod model;
