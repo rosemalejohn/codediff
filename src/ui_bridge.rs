@@ -1,4 +1,5 @@
 //! Maps controller Events onto `AppWindow` properties and UI callbacks onto Commands.
+use crate::branch::{BranchInfo, HeadInfo};
 use crate::controller::{Command, DiffView, Event, RangeInfo, Selection};
 use crate::history::relative_time;
 use crate::highlight::{StyledCell, StyledRow};
@@ -7,8 +8,8 @@ use crate::model::{
     file_fingerprint, hunk_fingerprint, ChangeSide, CommitInfo, DiffBody, FileEntry, FileStatus, LineKind,
 };
 use crate::settings::{Appearance, Settings};
-use crate::switcher::{project_name, rank};
-use crate::ui::{AppWindow, CellData, CommitRow, FileRow, ProjectItem, RowData, SegData};
+use crate::switcher::{project_name, rank, rank_names};
+use crate::ui::{AppWindow, CellData, CommitRow, FileRow, RowData, SegData, SwitcherItem};
 use git2::Oid;
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::collections::HashSet;
@@ -46,6 +47,8 @@ const HIST_NONE: i32 = 0;
 const HIST_COMMIT: i32 = 1;
 const HIST_RANGE: i32 = 2;
 
+const SWITCHER_BRANCHES: i32 = 1;
+
 /// Width of `cols` monospace columns of diff text plus its end padding.
 fn text_width(cols: usize) -> f32 {
     cols as f32 * CHAR_WIDTH + TEXT_END_PAD
@@ -73,6 +76,9 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
         Event::RepoOpened { name, path, recent } => {
             window.set_repo_name(name.into());
             window.set_repo_path(display_path(&path).into());
+            window.set_branch_name(SharedString::new());
+            window.set_branch_detached(false);
+            window.set_branches(ModelRc::new(VecModel::<SwitcherItem>::default()));
             set_recent(window, &recent);
             window.set_has_repo(true);
             window.set_error_text(SharedString::new());
@@ -116,6 +122,21 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
             mark_selection(window);
         }
         Event::Error(msg) => window.set_error_text(msg.into()),
+        Event::Head(head) => {
+            let (name, detached) = match head {
+                HeadInfo::Branch(b) => (b, false),
+                HeadInfo::Detached(id) => (id, true),
+            };
+            window.set_branch_name(name.into());
+            window.set_branch_detached(detached);
+        }
+        Event::Branches(list) => {
+            let items: Vec<SwitcherItem> = list.iter().map(|b| branch_item(b, now)).collect();
+            window.set_branches(ModelRc::new(VecModel::from(items)));
+            if window.get_switcher_open() && window.get_switcher_mode() == SWITCHER_BRANCHES {
+                filter_branches(window, &window.get_switcher_query());
+            }
+        }
         Event::Diff(Some(view)) => {
             let history = view.side.is_none();
             let path = view.file.path.clone();
@@ -575,16 +596,43 @@ pub fn set_recent(window: &AppWindow, paths: &[PathBuf]) {
 fn filter_projects(window: &AppWindow, query: &str) {
     let paths: Vec<String> = window.get_recent().iter().map(|p| p.to_string()).collect();
     let current = window.get_repo_path();
-    let items: Vec<ProjectItem> = rank(query, &paths)
+    let items: Vec<SwitcherItem> = rank(query, &paths)
         .into_iter()
         .map(|i| {
             let p = paths[i].as_str();
-            ProjectItem { name: project_name(p).into(), path: p.into(), current: window.get_has_repo() && current == p }
+            SwitcherItem {
+                name: project_name(p).into(),
+                detail: p.into(),
+                key: p.into(),
+                current: window.get_has_repo() && current == p,
+            }
         })
         .collect();
+    show_items(window, query, items);
+}
+
+/// Fills the Cmd+B list with the branches matching `query`, best first. With
+/// no query the list keeps the controller's order (local branches, newest
+/// first) and highlights the first branch other than the current one.
+fn filter_branches(window: &AppWindow, query: &str) {
+    let all: Vec<SwitcherItem> = window.get_branches().iter().collect();
+    let names: Vec<String> = all.iter().map(|b| b.name.to_string()).collect();
+    let items = rank_names(query, &names).into_iter().map(|i| all[i].clone()).collect();
+    show_items(window, query, items);
+}
+
+fn show_items(window: &AppWindow, query: &str, items: Vec<SwitcherItem>) {
     let index = if query.trim().is_empty() { items.iter().position(|i| !i.current).unwrap_or(0) } else { 0 };
     window.set_switcher_index(index as i32);
     window.set_switcher_items(ModelRc::new(VecModel::from(items)));
+}
+
+fn branch_item(b: &BranchInfo, now: i64) -> SwitcherItem {
+    let mut detail = format!("{} \u{b7} {}", b.summary, relative_time(now, b.time));
+    if b.remote {
+        detail = format!("remote \u{b7} {detail}");
+    }
+    SwitcherItem { name: b.name.as_str().into(), detail: detail.into(), key: b.refname.as_str().into(), current: b.current }
 }
 
 /// Applies a saved appearance choice (System follows macOS).
@@ -628,9 +676,19 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     let weak = window.as_weak();
     window.on_switcher_filter(move |query| {
         if let Some(w) = weak.upgrade() {
-            filter_projects(&w, &query);
+            if w.get_switcher_mode() == SWITCHER_BRANCHES {
+                filter_branches(&w, &query);
+            } else {
+                filter_projects(&w, &query);
+            }
         }
     });
+
+    let s = send.clone();
+    window.on_list_branches(move || s(Command::ListBranches));
+
+    let s = send.clone();
+    window.on_checkout_branch(move |refname| s(Command::Checkout(refname.into())));
 
     let s = send.clone();
     let weak = window.as_weak();
@@ -1710,7 +1768,7 @@ mod tests {
         assert_eq!(items.row_count(), 3);
         let first = items.row_data(0).unwrap();
         assert_eq!((first.name.as_str(), first.current), ("diffchecker", true));
-        assert_eq!(items.row_data(1).unwrap().path, "/w/wannahookup");
+        assert_eq!(items.row_data(1).unwrap().key, "/w/wannahookup");
         assert_eq!(w.get_switcher_index(), 1);
 
         w.invoke_switcher_filter("whk".into());
@@ -1740,6 +1798,58 @@ mod tests {
         // Nothing open: no row is current, the first is highlighted.
         assert_eq!(w.get_switcher_index(), 0);
         assert!(!w.get_switcher_items().row_data(0).unwrap().current);
+    }
+
+    fn branch(name: &str, remote: bool, current: bool) -> BranchInfo {
+        let refname = if remote { format!("refs/remotes/{name}") } else { format!("refs/heads/{name}") };
+        BranchInfo { name: name.into(), refname, remote, current, summary: "msg".into(), time: 0 }
+    }
+
+    #[test]
+    fn head_event_shows_branch_or_detached_commit() {
+        let w = window();
+        apply(&w, Event::Head(HeadInfo::Branch("main".into())));
+        assert_eq!((w.get_branch_name().as_str(), w.get_branch_detached()), ("main", false));
+        apply(&w, Event::Head(HeadInfo::Detached("abc1234".into())));
+        assert_eq!((w.get_branch_name().as_str(), w.get_branch_detached()), ("abc1234", true));
+    }
+
+    #[test]
+    fn cmd_b_lists_filters_and_checks_out_branches() {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        w.show().unwrap();
+        opened(&w, "/w/proj", &["/w/proj"]);
+        log.borrow_mut().clear();
+        press(&w, "b".into(), true);
+        assert!(w.get_switcher_open());
+        assert_eq!(w.get_switcher_mode(), SWITCHER_BRANCHES);
+        assert!(matches!(log.borrow().as_slice(), [Command::ListBranches]));
+
+        // The list arrives while the switcher is open.
+        apply(
+            &w,
+            Event::Branches(vec![
+                branch("main", false, true),
+                branch("feature/login", false, false),
+                branch("origin/fix-typo", true, false),
+            ]),
+        );
+        let items = w.get_switcher_items();
+        assert_eq!(items.row_count(), 3);
+        assert_eq!(w.get_switcher_index(), 1);
+        let remote = items.row_data(2).unwrap();
+        assert!(remote.detail.starts_with("remote"));
+
+        w.invoke_switcher_filter("fxt".into());
+        let items = w.get_switcher_items();
+        assert_eq!(items.row_count(), 1);
+        assert_eq!(items.row_data(0).unwrap().key, "refs/remotes/origin/fix-typo");
+
+        log.borrow_mut().clear();
+        w.invoke_checkout_branch("refs/remotes/origin/fix-typo".into());
+        assert!(matches!(log.borrow().as_slice(), [Command::Checkout(r)] if r == "refs/remotes/origin/fix-typo"));
     }
 
     #[test]

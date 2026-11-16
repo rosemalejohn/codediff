@@ -1,4 +1,4 @@
-use codediff::switcher::{fuzzy_score, project_name, rank};
+use codediff::switcher::{fuzzy_score, project_name, rank, rank_names};
 
 fn paths(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
@@ -46,4 +46,12 @@ fn project_name_is_last_component() {
     assert_eq!(project_name("/Users/me/Work/diffchecker"), "diffchecker");
     assert_eq!(project_name("/Users/me/Work/diffchecker/"), "diffchecker");
     assert_eq!(project_name("solo"), "solo");
+}
+
+#[test]
+fn rank_names_matches_whole_branch_name() {
+    let n = paths(&["main", "feature/login", "origin/feature/logout"]);
+    assert_eq!(rank_names("", &n), vec![0, 1, 2]);
+    assert_eq!(rank_names("flog", &n), vec![1, 2]);
+    assert!(rank_names("zzz", &n).is_empty());
 }

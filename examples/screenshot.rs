@@ -1,7 +1,7 @@
 //! Renders the real CodeDiff UI offscreen and writes a BMP, for UI review
 //! without screen-capture permission.
 //!
-//! Usage: cargo run --example screenshot -- <repo> <out.bmp> <appearance 0|1|2> [menu]
+//! Usage: cargo run --example screenshot -- <repo> <out.bmp> <appearance 0|1|2> [menu|branches]
 //! Convert with: sips -s format png out.bmp --out out.png
 
 use codediff::controller::Controller;
@@ -124,6 +124,14 @@ fn main() {
             app.invoke_select_commit(row.id.clone());
             pump(&app, &rx, 1500);
         }
+    }
+
+    // `branches`: open the Cmd+B branch switcher.
+    if args.get(4).map(String::as_str) == Some("branches") {
+        app.set_switcher_mode(1);
+        app.set_switcher_open(true);
+        app.invoke_list_branches();
+        pump(&app, &rx, 500);
     }
 
     if open_menu {

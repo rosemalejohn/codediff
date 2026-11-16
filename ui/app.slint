@@ -3,7 +3,7 @@ import { ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon, FlatButton, CountBadge, Kbd } from "theme.slint";
 import { FileRow, CommitRow, ChangesSidebar, HistorySidebar, FileStrip } from "sidebar.slint";
 import { RepoMenu, ErrorBanner, ConfirmDialog } from "dialogs.slint";
-import { ProjectItem, ProjectSwitcher } from "switcher.slint";
+import { SwitcherItem, Switcher } from "switcher.slint";
 import { SegData, CellData, RowData, DiffPane } from "diffview.slint";
 
 export { FileRow, CommitRow, SegData, CellData, RowData }
@@ -307,11 +307,19 @@ export component AppWindow inherits Window {
     // Path of the open repository (as listed in `recent`); empty when none.
     in-out property <string> repo-path;
     in-out property <[string]> recent;
-    // Cmd+K project switcher: visible flag, search text, filtered list and
-    // the highlighted row. The bridge fills the list on switcher-filter.
+    // Checked-out branch, or the short commit id when HEAD is detached.
+    in-out property <string> branch-name;
+    in-out property <bool> branch-detached;
+    // Every branch from the last list-branches; the bridge filters it into
+    // switcher-items while the branch switcher is open.
+    in-out property <[SwitcherItem]> branches;
+    // Search switcher, Cmd+K over projects (mode 0) or Cmd+B over branches
+    // (mode 1): visible flag, search text, filtered list and the highlighted
+    // row. The bridge fills the list on switcher-filter.
     in-out property <bool> switcher-open;
+    in-out property <int> switcher-mode: 0;
     in-out property <string> switcher-query;
-    in-out property <[ProjectItem]> switcher-items;
+    in-out property <[SwitcherItem]> switcher-items;
     in-out property <int> switcher-index;
     in-out property <int> active-tab: 0; // 0 Changes, 1 History
     in-out property <[FileRow]> staged;
@@ -378,6 +386,9 @@ export component AppWindow inherits Window {
     callback open-repo-dialog();
     callback open-recent(string);
     callback switcher-filter(string);
+    // Asks the controller for the branch list (answered into `branches`).
+    callback list-branches();
+    callback checkout-branch(string);
     callback select-change(int, string);
     callback dismiss-error();
     callback dark-changed(bool);
@@ -412,8 +423,18 @@ export component AppWindow inherits Window {
     forward-focus: keys;
 
     function show-switcher() {
+        root.switcher-mode = 0;
         root.switcher-query = "";
         root.switcher-filter("");
+        root.switcher-open = true;
+    }
+
+    function show-branch-switcher() {
+        root.switcher-mode = 1;
+        root.switcher-query = "";
+        // Shows the last known list at once; list-branches refreshes it.
+        root.switcher-filter("");
+        root.list-branches();
         root.switcher-open = true;
     }
 
@@ -451,6 +472,11 @@ export component AppWindow inherits Window {
             }
             if !root.has-repo {
                 return reject;
+            }
+            // Cmd+B: branch switcher.
+            if event.modifiers.control && (event.text == "b" || event.text == "B") {
+                root.show-branch-switcher();
+                return accept;
             }
             // Up/Down: files in Changes, commits in History.
             if event.text == Key.UpArrow || event.text == Key.DownArrow {
@@ -564,6 +590,52 @@ export component AppWindow inherits Window {
                                 root.open-repo-dialog();
                                 keys.focus();
                             }
+                        }
+                    }
+                }
+
+                // Current branch; opens the branch switcher.
+                if root.has-repo: branch-button := Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    height: 28px;
+                    width: min(branch-layout.preferred-width, 260px);
+                    border-radius: Theme.radius;
+                    background: branch-touch.has-hover ? Theme.row-hover : transparent;
+
+                    branch-layout := HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 8px;
+                        spacing: 6px;
+
+                        Icon {
+                            y: (parent.height - self.height) / 2;
+                            size: 14px;
+                            glyph: Icons.branch;
+                            tint: Theme.text-muted;
+                        }
+
+                        Text {
+                            text: root.branch-detached ? "detached at " + root.branch-name : root.branch-name;
+                            color: root.branch-detached ? Theme.text-muted : Theme.text;
+                            font-size: Theme.font-size;
+                            font-weight: 500;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+
+                        Icon {
+                            y: (parent.height - self.height) / 2;
+                            size: 12px;
+                            glyph: Icons.chevron-down;
+                            tint: Theme.text-muted;
+                        }
+                    }
+
+                    branch-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.show-branch-switcher();
                         }
                     }
                 }
@@ -983,10 +1055,13 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.switcher-open: switcher := ProjectSwitcher {
+    if root.switcher-open: switcher := Switcher {
         width: root.width;
         height: root.height;
         items: root.switcher-items;
+        placeholder: root.switcher-mode == 1 ? "Switch branch" : "Search projects";
+        empty-text: root.switcher-mode == 1 ? "No matching branches" : "No matching projects";
+        action-hint: root.switcher-mode == 1 ? "checkout" : "open";
         index <=> root.switcher-index;
         query <=> root.switcher-query;
         init => {
@@ -1000,8 +1075,13 @@ export component AppWindow inherits Window {
         }
         activate(item) => {
             root.close-switcher();
-            if !item.current {
-                root.open-recent(item.path);
+            if item.current {
+                return;
+            }
+            if root.switcher-mode == 1 {
+                root.checkout-branch(item.key);
+            } else {
+                root.open-recent(item.key);
             }
         }
     }

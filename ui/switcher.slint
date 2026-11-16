@@ -1,16 +1,19 @@
-// Cmd+K project switcher: fuzzy search box over the recent projects.
+// Fuzzy search picker: Cmd+K over the recent projects, Cmd+B over branches.
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 
-export struct ProjectItem {
+export struct SwitcherItem {
     name: string,
-    path: string,
-    // The project open now.
+    // Second line under the name.
+    detail: string,
+    // What activating the row acts on (project path or branch ref name).
+    key: string,
+    // The project open now, or the checked-out branch.
     current: bool,
 }
 
-component ProjectRow inherits Rectangle {
-    in property <ProjectItem> item;
+component SwitcherRow inherits Rectangle {
+    in property <SwitcherItem> item;
     in property <bool> selected;
     callback clicked();
     callback hovered();
@@ -36,7 +39,7 @@ component ProjectRow inherits Rectangle {
             }
 
             Text {
-                text: root.item.path;
+                text: root.item.detail;
                 color: Theme.text-muted;
                 font-size: Theme.small-font-size;
                 overflow: elide;
@@ -62,12 +65,15 @@ component ProjectRow inherits Rectangle {
     }
 }
 
-export component ProjectSwitcher inherits Rectangle {
-    in property <[ProjectItem]> items;
+export component Switcher inherits Rectangle {
+    in property <[SwitcherItem]> items;
+    in property <string> placeholder: "Search projects";
+    in property <string> empty-text: "No matching projects";
+    in property <string> action-hint: "open";
     in-out property <int> index;
     in-out property <string> query;
     callback filter(string);
-    callback activate(ProjectItem);
+    callback activate(SwitcherItem);
     callback close();
 
     property <length> row-height: 46px;
@@ -151,7 +157,7 @@ export component ProjectSwitcher inherits Rectangle {
                     if root.query == "": Text {
                         width: parent.width;
                         height: parent.height;
-                        text: "Search projects";
+                        text: root.placeholder;
                         color: Theme.text-muted;
                         font-size: 14px;
                         vertical-alignment: center;
@@ -182,7 +188,7 @@ export component ProjectSwitcher inherits Rectangle {
             list := ListView {
                 height: min(root.items.length, root.max-rows) * root.row-height;
 
-                for item[i] in root.items: ProjectRow {
+                for item[i] in root.items: SwitcherRow {
                     item: item;
                     selected: i == root.index;
                     hovered => {
@@ -196,7 +202,7 @@ export component ProjectSwitcher inherits Rectangle {
 
             if root.items.length == 0: Text {
                 height: 44px;
-                text: "No matching projects";
+                text: root.empty-text;
                 color: Theme.text-muted;
                 font-size: Theme.font-size;
                 horizontal-alignment: center;
@@ -211,7 +217,7 @@ export component ProjectSwitcher inherits Rectangle {
                 Text {
                     x: 14px;
                     height: parent.height;
-                    text: "\u{2191}\u{2193} navigate   enter open   esc close";
+                    text: "\u{2191}\u{2193} navigate   enter " + root.action-hint + "   esc close";
                     color: Theme.text-muted;
                     font-size: Theme.small-font-size;
                     vertical-alignment: center;

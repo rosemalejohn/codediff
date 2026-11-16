@@ -10,6 +10,8 @@ pub enum CoreError {
     NotARepo(PathBuf),
     #[error("File changed, refreshed. Try again.")]
     Stale,
+    #[error("Your local changes would be overwritten. Commit or discard them first.")]
+    CheckoutConflict,
     #[error("{0}")]
     Json(#[from] serde_json::Error),
 }

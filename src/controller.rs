@@ -1,4 +1,5 @@
 //! Background worker that owns the repository and turns Commands into Events.
+use crate::branch::{self, BranchInfo, HeadInfo};
 use crate::diff::{diff_stats, file_diff, files_in_target};
 use crate::highlight::{Highlighter, StyledRow};
 use crate::history::list_commits;
@@ -54,6 +55,10 @@ pub enum Command {
         dir: ExpandDir,
     },
     LoadMoreHistory,
+    /// Emit `Event::Branches` for the branch switcher.
+    ListBranches,
+    /// Check out a branch by full reference name (`refs/heads/..` or `refs/remotes/..`).
+    Checkout(String),
     StageFile(String),
     UnstageFile(String),
     /// `fingerprint` is `file_fingerprint` of the unstaged diff the user saw.
@@ -115,6 +120,9 @@ pub enum Event {
     Files(Vec<FileEntry>),
     Range(Option<RangeInfo>),
     Diff(Option<DiffView>),
+    /// What HEAD points at; emitted on open and whenever it changes.
+    Head(HeadInfo),
+    Branches(Vec<BranchInfo>),
     Error(String),
 }
 
@@ -175,6 +183,8 @@ struct OpenRepo {
     _watcher: Option<RepoWatcher>,
     loaded: usize,
     seen: HashSet<Oid>,
+    /// Last emitted HEAD, to emit `Event::Head` only on change.
+    head: Option<HeadInfo>,
 }
 
 struct Worker {
@@ -280,6 +290,13 @@ impl Worker {
                 self.emit_diff();
             }
             Command::LoadMoreHistory => self.load_more_history(),
+            Command::ListBranches => {
+                let Some(o) = &self.open else { return };
+                if let Some(list) = self.report(branch::list_branches(&o.repo)) {
+                    self.emit(Event::Branches(list));
+                }
+            }
+            Command::Checkout(refname) => self.mutate(|r| branch::checkout(r, &refname)),
             Command::StageFile(p) => self.mutate(|r| stage::stage_file(r, &p)),
             Command::UnstageFile(p) => self.mutate(|r| stage::unstage_file(r, &p)),
             Command::DiscardFile { path, fingerprint } => self.discard_file(path, fingerprint),
@@ -352,6 +369,7 @@ impl Worker {
             _watcher: watcher,
             loaded: 0,
             seen: HashSet::new(),
+            head: None,
         });
         self.selection = Selection::None;
         self.force_full = false;
@@ -363,9 +381,23 @@ impl Worker {
             path: root,
             recent: recent.paths,
         });
+        self.emit_head();
         self.emit_status();
         self.emit_history_head(true);
         self.emit(Event::Diff(None));
+    }
+
+    /// Emits `Event::Head` when HEAD differs from the last one emitted.
+    fn emit_head(&mut self) {
+        let Some(o) = &mut self.open else { return };
+        let head = match branch::head_info(&o.repo) {
+            Ok(h) => h,
+            Err(e) => return self.emit(Event::Error(e.to_string())),
+        };
+        if o.head.as_ref() != Some(&head) {
+            o.head = Some(head.clone());
+            self.emit(Event::Head(head));
+        }
     }
 
     fn emit_status(&self) {
@@ -420,6 +452,7 @@ impl Worker {
         if self.open.is_none() {
             return;
         }
+        self.emit_head();
         self.emit_status();
         self.emit_history_head(false);
         if self.follow_head() {

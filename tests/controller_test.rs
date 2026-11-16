@@ -729,3 +729,27 @@ fn expand_gap_reveals_unchanged_lines_and_resets_on_select() {
     let again = select_unstaged(&h, "f.txt");
     assert_eq!(lines(&again), before);
 }
+
+#[test]
+fn open_emits_head_and_checkout_switches_branch() {
+    use codediff::branch::HeadInfo;
+    let t = TestRepo::new();
+    t.write("a.txt", b"one\n");
+    t.stage("a.txt");
+    t.commit("first");
+    let head = t.repo.head().unwrap().peel_to_commit().unwrap();
+    t.repo.branch("feature", &head, false).unwrap();
+    let h = Harness::new();
+    h.open(t.path());
+    h.wait_for(0, |e| matches!(e, Event::Head(HeadInfo::Branch(b)) if b != "feature"));
+
+    let m = h.mark();
+    h.ctl.send(Command::ListBranches);
+    let (_, e) = h.wait_for(m, |e| matches!(e, Event::Branches(_)));
+    let Event::Branches(list) = e else { unreachable!() };
+    assert_eq!(list.len(), 2);
+
+    let m = h.mark();
+    h.ctl.send(Command::Checkout("refs/heads/feature".into()));
+    h.wait_for(m, |e| matches!(e, Event::Head(HeadInfo::Branch(b)) if b == "feature"));
+}

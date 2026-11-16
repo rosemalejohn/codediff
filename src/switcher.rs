@@ -1,4 +1,4 @@
-//! Fuzzy matching for the project switcher (Cmd+K).
+//! Fuzzy matching for the project (Cmd+K) and branch (Cmd+B) switchers.
 
 /// Score of `query` as a case-insensitive subsequence of `text`, higher is
 /// better; None when some query character is missing. Consecutive matches and
@@ -60,6 +60,18 @@ pub fn rank(query: &str, paths: &[String]) -> Vec<usize> {
             let by_path = if query.contains('/') { fuzzy_score(query, p) } else { None };
             by_name.max(by_path).map(|s| (s, i))
         })
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, i)| i).collect()
+}
+
+/// Indexes of `names` matching `query` against the whole name, best first.
+/// Ties and an empty query keep the given order.
+pub fn rank_names(query: &str, names: &[String]) -> Vec<usize> {
+    let mut hits: Vec<(i32, usize)> = names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| fuzzy_score(query, n).map(|s| (s, i)))
         .collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     hits.into_iter().map(|(_, i)| i).collect()
