@@ -453,15 +453,22 @@ export component AppWindow inherits Window {
         keys.focus();
     }
 
-    // Below 760px the Git Flow button drops its label. Set from a change
-    // handler: binding the top bar layout to the window width directly would
-    // make a binding loop with the window's minimum size.
+    // Narrow windows collapse top bar text: below 860px the Switch project
+    // button keeps only its icon and key cap, below 760px the Git Flow button
+    // drops its label. Set from handlers: binding the top bar layout to the
+    // window width directly would make a binding loop with the window's
+    // minimum size.
+    property <bool> compact: false;
     property <bool> narrow: false;
-    init => {
+    function fit-top-bar() {
+        root.compact = root.width < 860px;
         root.narrow = root.width < 760px;
     }
+    init => {
+        root.fit-top-bar();
+    }
     changed width => {
-        root.narrow = root.width < 760px;
+        root.fit-top-bar();
     }
 
     changed dark => {
@@ -547,7 +554,9 @@ export component AppWindow inherits Window {
 
             HorizontalLayout {
                 padding-left: 10px;
-                padding-right: 12px;
+                // Keeps clear of the switch and appearance buttons pinned on
+                // the right; the branch button elides to fit.
+                padding-right: switch-button.width + 28px + 12px + 8px + 10px;
                 spacing: 10px;
                 alignment: start;
 
@@ -627,7 +636,10 @@ export component AppWindow inherits Window {
                 if root.has-repo: branch-button := Rectangle {
                     y: (parent.height - self.height) / 2;
                     height: 28px;
-                    width: min(branch-layout.preferred-width, 260px);
+                    min-width: 64px;
+                    preferred-width: min(branch-layout.preferred-width, 260px);
+                    max-width: self.preferred-width;
+                    horizontal-stretch: 1;
                     border-radius: Theme.radius;
                     background: branch-touch.has-hover ? Theme.row-hover : transparent;
 
@@ -801,7 +813,7 @@ export component AppWindow inherits Window {
                         tint: Theme.text-muted;
                     }
 
-                    Text {
+                    if !root.compact: Text {
                         text: "Switch project";
                         color: Theme.text-muted;
                         font-size: Theme.font-size - 1px;
