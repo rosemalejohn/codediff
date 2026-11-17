@@ -459,3 +459,30 @@ fn latest_tag_with_many_tags_is_fast() {
     assert_eq!(found.name, "1.0.399");
     assert!(took < std::time::Duration::from_millis(500), "latest_tag took {took:?}");
 }
+
+/// `feature/login` and `feature/login/v2` cannot both exist (one would be a
+/// file and a directory under refs/heads). Refused before anything changes,
+/// from a HEAD whose tree differs from the base's.
+#[test]
+fn start_refuses_names_nested_with_an_existing_branch() {
+    for (existing, name, other) in [("feature/login", "login/v2", "feature/login"), ("feature/login/v2", "login", "feature/login/v2")] {
+        let (t, cfg) = flow_repo();
+        t.commit_file("b.txt", b"develop work\n", "develop work");
+        t.branch(existing);
+        t.checkout(&cfg.production);
+        let head = t.repo.head().unwrap().target();
+        let branch = format!("feature/{name}");
+        let msg = format!("{branch} conflicts with existing branch {other}.");
+
+        assert_eq!(start_error(&t.repo, &cfg, Feature, name).as_deref(), Some(msg.as_str()));
+        let err = start(&t.repo, &cfg, Feature, name);
+        assert!(matches!(err, Err(CoreError::Flow(ref m)) if *m == msg), "{err:?}");
+        assert_eq!(t.head_branch(), cfg.production);
+        assert_eq!(t.repo.head().unwrap().target(), head);
+        assert!(!t.has_branch(&branch));
+        assert!(!t.exists("b.txt"));
+        assert_eq!(t.index_blob("b.txt"), None);
+        let s = codediff::status::list_status(&t.repo).unwrap();
+        assert!(s.staged.is_empty() && s.unstaged.is_empty(), "{s:?}");
+    }
+}

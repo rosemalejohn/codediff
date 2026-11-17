@@ -307,6 +307,11 @@ pub fn start_error(repo: &Repository, cfg: &FlowConfig, kind: FlowKind, name: &s
     if repo.find_reference(&format!("refs/remotes/origin/{branch}")).is_ok() {
         return Some(format!("{branch} already exists on origin."));
     }
+    // `a` and `a/b` cannot both exist: one would be a file and the other a
+    // directory under refs/heads. Caught here, before the checkout runs.
+    if let Some(other) = nested_branch(repo, &branch) {
+        return Some(format!("{branch} conflicts with existing branch {other}."));
+    }
     let (label, open) = match kind {
         FlowKind::Feature => return None,
         FlowKind::Release => ("release", &cfg.release),
@@ -318,6 +323,16 @@ pub fn start_error(repo: &Repository, cfg: &FlowConfig, kind: FlowKind, name: &s
     }
     let open_branch = branches_with_prefix(repo, open).ok()?.into_iter().next()?;
     Some(format!("A {label} is already open: {open_branch}."))
+}
+
+/// A local branch that `branch` would nest in, or that would nest in it.
+fn nested_branch(repo: &Repository, branch: &str) -> Option<String> {
+    let inside = |name: &str, dir: &str| name.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+    repo.branches(Some(BranchType::Local))
+        .ok()?
+        .flatten()
+        .filter_map(|(b, _)| b.name().ok().flatten().map(str::to_string))
+        .find(|other| inside(branch, other) || inside(other, branch))
 }
 
 /// Creates `prefix + name` from the base branch of `kind` and switches to it.

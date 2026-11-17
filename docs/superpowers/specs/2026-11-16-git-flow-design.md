@@ -175,7 +175,7 @@ Start and Initialize show no notice; the branch button changing is the feedback.
 ### 8.3 Start
 
 - Branch name is prefix plus the typed name. Feature and release start from the tip of local develop; hotfix starts from the tip of local production.
-- Refused, with an inline reason, when: the name is empty or not a valid branch name; the branch already exists locally or on origin (as last fetched); for release and hotfix, a tag named version-tag-prefix plus version already exists; a release (or hotfix) is already open.
+- Refused, with an inline reason, when: the name is empty or not a valid branch name; the branch already exists locally or on origin (as last fetched); the name nests with an existing local branch (`feature/login` and `feature/login/v2` cannot both exist); for release and hotfix, a tag named version-tag-prefix plus version already exists; a release (or hotfix) is already open.
 - The new branch is checked out with the existing safe checkout. Uncommitted changes come along. If they would be overwritten, nothing is created and the existing "local changes would be overwritten" error shows. (Claude's call: git-flow demands a clean tree for release and hotfix start; one rule for all three is simpler and loses nothing.)
 - No fetch, and no comparison with origin, on start.
 
