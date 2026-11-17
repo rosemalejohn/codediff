@@ -141,6 +141,56 @@ export component ErrorBanner inherits Rectangle {
     }
 }
 
+// Green banner at the top of the diff pane: what a Git Flow finish did.
+export component NoticeBanner inherits Rectangle {
+    in property <string> text;
+    callback dismiss();
+
+    background: Theme.notice-bg;
+    min-height: 40px;
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.notice-border;
+    }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 8px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 10px;
+
+        Icon {
+            y: (parent.height - self.height) / 2;
+            glyph: Icons.check-circle;
+            tint: Theme.letter-added;
+        }
+
+        Text {
+            text: root.text;
+            color: Theme.notice-text;
+            font-size: Theme.font-size;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+
+        FlatButton {
+            y: (parent.height - self.height) / 2;
+            text: "Dismiss";
+            ghost: true;
+            small: true;
+            icon: Icons.close;
+            vertical-stretch: 0;
+            clicked => {
+                root.dismiss();
+            }
+        }
+    }
+}
+
 // Modal confirmation for destructive actions. Cancel is the default:
 // Escape and Return both cancel.
 export component ConfirmDialog inherits Rectangle {

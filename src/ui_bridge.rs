@@ -2,6 +2,7 @@
 use crate::branch::{BranchInfo, HeadInfo};
 use crate::controller::{Command, DiffView, Event, RangeInfo, Selection};
 use crate::flow::{next_actions, FlowConfig, FlowKind, FlowState};
+use crate::flow_finish::{Blocker, FinishPlan, FinishRequest};
 use crate::history::relative_time;
 use crate::highlight::{StyledCell, StyledRow};
 use crate::sbs::{ExpandDir, GapCtl};
@@ -13,6 +14,7 @@ use crate::switcher::{project_name, rank, rank_names};
 use crate::ui::{AppWindow, CellData, CommitRow, FileRow, Flow, FlowStep, RowData, SegData, SwitcherItem};
 use git2::Oid;
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -130,6 +132,8 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
             if f.get_dialog() != FLOW_DIALOG_NONE {
                 f.set_error(msg.as_str().into());
             }
+            // The red banner takes over from the green one.
+            f.set_notice(SharedString::new());
             window.set_error_text(msg.into());
         }
         Event::Head(head) => {
@@ -195,8 +199,18 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
             f.set_notice(text.into());
         }
         Event::FlowFailed(text) => window.global::<Flow>().set_error(text.into()),
-        // The finish dialog (Task 10) maps these.
-        Event::FlowPlan { .. } | Event::FlowPushing | Event::FlowPushFailed(_) => {}
+        Event::FlowPlan { request, plan } => apply_finish_plan(window, &request, plan),
+        Event::FlowPushing => {
+            let f = window.global::<Flow>();
+            f.set_dialog(FLOW_DIALOG_PUSHING);
+            set_step_states(window, STEP_RUNNING);
+        }
+        Event::FlowPushFailed(reason) => {
+            let f = window.global::<Flow>();
+            f.set_dialog(FLOW_DIALOG_PUSH_FAILED);
+            f.set_push_reason(reason.into());
+            set_step_states(window, STEP_FAILED);
+        }
     }
 }
 
@@ -662,6 +676,17 @@ const FLOW_DIALOG_NONE: i32 = 0;
 const FLOW_DIALOG_INIT: i32 = 1;
 const FLOW_DIALOG_START: i32 = 2;
 const FLOW_DIALOG_FINISH: i32 = 3;
+const FLOW_DIALOG_PUSHING: i32 = 4;
+const FLOW_DIALOG_PUSH_FAILED: i32 = 5;
+// Flow.blocker-level: Finish disabled, or only Close.
+const BLOCKER_NONE: i32 = 0;
+const BLOCKER_WARN: i32 = 1;
+const BLOCKER_CLOSE: i32 = 2;
+// FlowStep.state.
+const STEP_PENDING: i32 = 0;
+const STEP_DONE: i32 = 1;
+const STEP_RUNNING: i32 = 2;
+const STEP_FAILED: i32 = 3;
 
 fn flow_kind_index(kind: FlowKind) -> i32 {
     match kind {
@@ -782,8 +807,8 @@ fn filter_flow_actions(window: &AppWindow, query: &str) {
 }
 
 /// Opens the dialog for an action key (`init`, `start:<kind>`,
-/// `finish:<kind>[:<branch>]`). The dialogs fill their own fields.
-fn flow_action(window: &AppWindow, key: &str) {
+/// `finish:<kind>[:<branch>]`). Finish fills its defaults and asks for a plan.
+fn flow_action(window: &AppWindow, key: &str, send: &dyn Fn(Command)) {
     let f = window.global::<Flow>();
     let mut parts = key.splitn(3, ':');
     let (dialog, kind) = match (parts.next(), parts.next().and_then(flow_kind_from_key)) {
@@ -812,9 +837,119 @@ fn flow_action(window: &AppWindow, key: &str) {
             f.set_start_error(SharedString::new());
             f.set_error(SharedString::new());
         }
+        FLOW_DIALOG_FINISH => open_finish(window, parts.next()),
         _ => {}
     }
     f.set_dialog(dialog);
+    if dialog == FLOW_DIALOG_FINISH {
+        send(Command::FlowPlan(finish_request(window)));
+    }
+}
+
+// ---- git flow: finish ----
+
+/// Fills the Finish fields for the kind in `Flow.kind`: the given branch,
+/// else the checked-out one of this kind, else the first open one.
+fn open_finish(window: &AppWindow, branch: Option<&str>) {
+    let f = window.global::<Flow>();
+    let kind = flow_dialog_kind(window);
+    let options: Vec<SharedString> = match kind {
+        FlowKind::Feature => f.get_features().iter().collect(),
+        FlowKind::Release => [f.get_release()].into_iter().filter(|b| !b.is_empty()).collect(),
+        FlowKind::Hotfix => [f.get_hotfix()].into_iter().filter(|b| !b.is_empty()).collect(),
+    };
+    let current = (f.get_current_kind() == flow_kind_index(kind)).then(|| f.get_current_branch());
+    let branch = match branch {
+        Some(b) => b.into(),
+        None => current.or_else(|| options.first().cloned()).unwrap_or_default(),
+    };
+    let (tag, message) = finish_defaults(window, kind, &branch);
+    f.set_branch_options(ModelRc::new(VecModel::from(options)));
+    f.set_branch(branch);
+    f.set_tag(tag.into());
+    f.set_message(message.into());
+    f.set_delete_branch(true);
+    f.set_push(kind != FlowKind::Feature && f.get_push_blocked().is_empty() && f.get_push_default());
+    clear_finish_plan(window);
+    f.set_error(SharedString::new());
+}
+
+/// Default tag and tag message for `branch`; both empty for a feature.
+fn finish_defaults(window: &AppWindow, kind: FlowKind, branch: &str) -> (String, String) {
+    let f = window.global::<Flow>();
+    let (prefix, word) = match kind {
+        FlowKind::Feature => return (String::new(), String::new()),
+        FlowKind::Release => (f.get_release_prefix(), "Release"),
+        FlowKind::Hotfix => (f.get_hotfix_prefix(), "Hotfix"),
+    };
+    let version = branch.strip_prefix(prefix.as_str()).unwrap_or(branch);
+    (format!("{}{version}", f.get_tag_prefix()), format!("{word} {version}"))
+}
+
+/// The finish the dialog shows. A feature never has a tag or a push, and a
+/// blocked push is never asked for.
+fn finish_request(window: &AppWindow) -> FinishRequest {
+    let f = window.global::<Flow>();
+    let kind = flow_dialog_kind(window);
+    let feature = kind == FlowKind::Feature;
+    let text = |s: SharedString| if feature { String::new() } else { s.into() };
+    FinishRequest {
+        kind,
+        branch: f.get_branch().into(),
+        tag: text(f.get_tag()),
+        message: text(f.get_message()),
+        delete_branch: f.get_delete_branch(),
+        push: !feature && f.get_push() && f.get_push_blocked().is_empty(),
+    }
+}
+
+fn clear_finish_plan(window: &AppWindow) {
+    let f = window.global::<Flow>();
+    f.set_steps(ModelRc::new(VecModel::<FlowStep>::default()));
+    f.set_blocker_level(BLOCKER_NONE);
+    f.set_blocker_title(SharedString::new());
+    f.set_blocker_body(SharedString::new());
+    f.set_blocker_files(string_model(&[]));
+}
+
+/// Shows a plan, unless it answers a request that is no longer on screen.
+fn apply_finish_plan(window: &AppWindow, request: &FinishRequest, plan: FinishPlan) {
+    let f = window.global::<Flow>();
+    if f.get_dialog() != FLOW_DIALOG_FINISH || *request != finish_request(window) {
+        return;
+    }
+    let steps: Vec<FlowStep> = plan
+        .steps
+        .into_iter()
+        .map(|s| FlowStep { text: s.text.into(), note: s.note.into(), remote: s.remote, state: STEP_PENDING })
+        .collect();
+    f.set_steps(ModelRc::new(VecModel::from(steps)));
+    let (level, title, body, files) = match &plan.blocker {
+        None => (BLOCKER_NONE, String::new(), String::new(), &[][..]),
+        Some(b) => {
+            let files = match b {
+                Blocker::Conflict { files, .. } | Blocker::Collision(files) => files.as_slice(),
+                _ => &[],
+            };
+            let level = if matches!(b, Blocker::Conflict { .. }) { BLOCKER_CLOSE } else { BLOCKER_WARN };
+            (level, b.title(), b.body(), files)
+        }
+    };
+    f.set_blocker_level(level);
+    f.set_blocker_title(title.into());
+    f.set_blocker_body(body.into());
+    f.set_blocker_files(string_model(files));
+}
+
+/// Marks local steps done and remote steps `remote_state` (push running or failed).
+fn set_step_states(window: &AppWindow, remote_state: i32) {
+    let steps: Vec<FlowStep> = window
+        .global::<Flow>()
+        .get_steps()
+        .iter()
+        .map(|s| FlowStep { state: if s.remote { remote_state } else { STEP_DONE }, ..s })
+        .collect();
+    window.global::<Flow>().set_steps(ModelRc::new(VecModel::from(steps)));
 }
 
 fn flow_has_branch(window: &AppWindow, name: &str) -> bool {
@@ -855,11 +990,16 @@ fn apply_start_check(window: &AppWindow, kind: FlowKind, name: &str, error: Opti
 
 fn wire_flow(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     let f = window.global::<Flow>();
+    // Branch of the last plan asked for, to tell when the picker moved.
+    let planned = Rc::new(RefCell::new(SharedString::new()));
 
+    let s = send.clone();
+    let p = planned.clone();
     let weak = window.as_weak();
     f.on_action(move |key| {
         if let Some(w) = weak.upgrade() {
-            flow_action(&w, &key);
+            flow_action(&w, &key, &s);
+            *p.borrow_mut() = w.global::<Flow>().get_branch();
         }
     });
 
@@ -895,11 +1035,59 @@ fn wire_flow(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         }
     });
 
-    let s = send;
+    let s = send.clone();
     let weak = window.as_weak();
     f.on_submit_start(move || {
         if let Some(w) = weak.upgrade() {
             s(Command::FlowStart { kind: flow_dialog_kind(&w), name: w.global::<Flow>().get_name().into() });
+        }
+    });
+
+    // ---- finish, push and notice ----
+
+    let s = send.clone();
+    let weak = window.as_weak();
+    f.on_plan_changed(move || {
+        let Some(w) = weak.upgrade() else { return };
+        let f = w.global::<Flow>();
+        let branch = f.get_branch();
+        if *planned.borrow() != branch {
+            let (tag, message) = finish_defaults(&w, flow_dialog_kind(&w), &branch);
+            f.set_tag(tag.into());
+            f.set_message(message.into());
+            *planned.borrow_mut() = branch;
+        }
+        s(Command::FlowPlan(finish_request(&w)));
+    });
+
+    // Only with a plan on screen and nothing blocking it.
+    let s = send.clone();
+    let weak = window.as_weak();
+    f.on_submit_finish(move || {
+        let Some(w) = weak.upgrade() else { return };
+        let f = w.global::<Flow>();
+        if f.get_dialog() == FLOW_DIALOG_FINISH && f.get_blocker_level() == BLOCKER_NONE && f.get_steps().row_count() > 0
+        {
+            s(Command::FlowFinish(finish_request(&w)));
+        }
+    });
+
+    let s = send.clone();
+    let weak = window.as_weak();
+    f.on_retry_push(move || {
+        if let Some(w) = weak.upgrade() {
+            w.global::<Flow>().set_error(SharedString::new());
+        }
+        s(Command::FlowRetryPush);
+    });
+
+    let s = send;
+    f.on_close_push_failed(move || s(Command::FlowDropPush));
+
+    let weak = window.as_weak();
+    f.on_dismiss_notice(move || {
+        if let Some(w) = weak.upgrade() {
+            w.global::<Flow>().set_notice(SharedString::new());
         }
     });
 }
@@ -2762,7 +2950,7 @@ mod tests {
         assert!(!w.get_switcher_open());
         let f = w.global::<Flow>();
         assert_eq!((f.get_dialog(), f.get_kind()), (3, 0));
-        assert!(log.borrow().is_empty());
+        assert!(matches!(log.borrow().as_slice(), [Command::FlowPlan(r)] if r.branch == "feature/login-form"));
     }
 
     #[test]
@@ -2796,8 +2984,6 @@ mod tests {
         let f = w.global::<Flow>();
         f.invoke_action("start:release".into());
         assert_eq!((f.get_dialog(), f.get_kind()), (2, 1));
-        f.invoke_action("finish:hotfix:hotfix/1.2.1".into());
-        assert_eq!((f.get_dialog(), f.get_kind()), (3, 2));
         f.invoke_action("init".into());
         assert_eq!(f.get_dialog(), 1);
         assert!(log.borrow().is_empty());
@@ -3040,5 +3226,483 @@ mod tests {
             log.borrow().last(),
             Some(Command::FlowCheckStart { kind: FlowKind::Hotfix, name }) if name == "1"
         ));
+    }
+
+    // ---- git flow: finish, push and notice ----
+
+    use crate::flow_finish::{Blocker, FinishPlan, FinishRequest, Step};
+
+    /// Tag prefix `v`, `release/1.2.0` open and checked out, push on by default.
+    fn release_state() -> FlowState {
+        let mut state = flow_state();
+        if let Some(c) = state.config.as_mut() {
+            c.version_tag = "v".into();
+        }
+        state.branches.push("release/1.2.0".into());
+        state.releases = vec!["release/1.2.0".into()];
+        state.current = Some((FlowKind::Release, "release/1.2.0".into()));
+        state.push_default = true;
+        state
+    }
+
+    /// Two open features, on `feature/login-form`.
+    fn two_features_state() -> FlowState {
+        let mut state = flow_state();
+        state.features = vec!["feature/login-form".into(), "feature/other".into()];
+        state.branches.push("feature/other".into());
+        state
+    }
+
+    fn step(text: &str, note: &str, remote: bool) -> Step {
+        Step { text: text.into(), note: note.into(), remote }
+    }
+
+    fn feature_request(branch: &str) -> FinishRequest {
+        FinishRequest {
+            kind: FlowKind::Feature,
+            branch: branch.into(),
+            tag: String::new(),
+            message: String::new(),
+            delete_branch: true,
+            push: false,
+        }
+    }
+
+    fn release_request() -> FinishRequest {
+        FinishRequest {
+            kind: FlowKind::Release,
+            branch: "release/1.2.0".into(),
+            tag: "v1.2.0".into(),
+            message: "Release 1.2.0".into(),
+            delete_branch: true,
+            push: true,
+        }
+    }
+
+    /// The seven steps of a release finish with push; the last two run on origin.
+    fn release_steps() -> Vec<Step> {
+        vec![
+            step("Merge release/1.2.0 into main", "5 commits", false),
+            step("Tag main as v1.2.0", "", false),
+            step("Merge release/1.2.0 back into develop", "", false),
+            step("Delete release/1.2.0", "", false),
+            step("Switch to develop", "", false),
+            step("Push main, develop and tag v1.2.0 to origin", "", true),
+            step("Delete release/1.2.0 on origin", "", true),
+        ]
+    }
+
+    fn feature_plan(blocker: Option<Blocker>) -> FinishPlan {
+        FinishPlan {
+            steps: vec![
+                step("Merge feature/login-form into develop", "3 commits", false),
+                step("Delete feature/login-form", "", false),
+                step("Switch to develop", "", false),
+            ],
+            blocker,
+        }
+    }
+
+    /// A Finish Feature dialog on `feature/login-form` with a clean plan shown.
+    fn finish_feature_window(blocker: Option<Blocker>) -> (AppWindow, Rc<RefCell<Vec<Command>>>) {
+        let (w, log) = flow_window(flow_state());
+        w.global::<Flow>().invoke_action("finish:feature".into());
+        apply(&w, Event::FlowPlan { request: feature_request("feature/login-form"), plan: feature_plan(blocker) });
+        log.borrow_mut().clear();
+        (w, log)
+    }
+
+    #[test]
+    fn finish_action_fills_defaults_and_requests_plan() {
+        let (w, log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release:release/1.2.0".into());
+        assert_eq!((f.get_dialog(), f.get_kind()), (3, 1));
+        assert_eq!(f.get_branch(), "release/1.2.0");
+        assert_eq!(f.get_branch_options().iter().collect::<Vec<_>>(), vec![SharedString::from("release/1.2.0")]);
+        assert_eq!((f.get_tag().as_str(), f.get_message().as_str()), ("v1.2.0", "Release 1.2.0"));
+        assert!(f.get_delete_branch() && f.get_push());
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::FlowPlan(r)] if r.branch == "release/1.2.0" && r.tag == "v1.2.0"
+                && r.message == "Release 1.2.0" && r.delete_branch && r.push
+        ));
+    }
+
+    #[test]
+    fn finish_hotfix_message_says_hotfix() {
+        let mut state = flow_state();
+        state.hotfixes = vec!["hotfix/1.2.1".into()];
+        let (w, log) = flow_window(state);
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:hotfix".into());
+        assert_eq!((f.get_kind(), f.get_branch().as_str()), (2, "hotfix/1.2.1"));
+        assert_eq!((f.get_tag().as_str(), f.get_message().as_str()), ("1.2.1", "Hotfix 1.2.1"));
+        // push_default is false in flow_state().
+        assert!(!f.get_push());
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::FlowPlan(r)] if r.kind == FlowKind::Hotfix && r.message == "Hotfix 1.2.1" && !r.push
+        ));
+    }
+
+    #[test]
+    fn finish_feature_defaults_to_current_branch_without_tag_or_push() {
+        let mut state = two_features_state();
+        state.push_default = true;
+        let (w, log) = flow_window(state);
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:feature".into());
+        assert_eq!((f.get_branch().as_str(), f.get_tag().as_str(), f.get_push()), ("feature/login-form", "", false));
+        assert_eq!(f.get_message(), "");
+        assert_eq!(f.get_branch_options().row_count(), 2);
+        assert!(matches!(log.borrow().as_slice(), [Command::FlowPlan(r)] if *r == feature_request("feature/login-form")));
+    }
+
+    #[test]
+    fn finish_feature_off_a_feature_branch_picks_the_first_option() {
+        let mut state = two_features_state();
+        state.features = vec!["feature/other".into(), "feature/login-form".into()];
+        state.current = None;
+        let (w, _log) = flow_window(state);
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:feature".into());
+        assert_eq!(f.get_branch(), "feature/other");
+        f.invoke_action("finish:feature:feature/login-form".into());
+        assert_eq!(f.get_branch(), "feature/login-form");
+    }
+
+    #[test]
+    fn finish_action_clears_old_plan_blocker_and_error() {
+        let (w, _log) = finish_feature_window(Some(Blocker::Dirty(2)));
+        let f = w.global::<Flow>();
+        f.set_error("failed".into());
+        f.invoke_action("finish:feature".into());
+        assert_eq!(f.get_steps().row_count(), 0);
+        assert_eq!((f.get_blocker_level(), f.get_blocker_title().as_str(), f.get_error().as_str()), (0, "", ""));
+    }
+
+    #[test]
+    fn push_tick_off_when_push_is_blocked() {
+        let mut state = release_state();
+        state.push_blocked = Some("No origin remote.".into());
+        let (w, log) = flow_window(state);
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        assert!(!f.get_push());
+        assert_eq!(f.get_push_blocked(), "No origin remote.");
+        assert!(matches!(log.borrow().as_slice(), [Command::FlowPlan(r)] if !r.push));
+    }
+
+    #[test]
+    fn push_is_never_requested_when_blocked_or_for_a_feature() {
+        let mut state = release_state();
+        state.push_blocked = Some("No origin remote.".into());
+        let (w, log) = flow_window(state);
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        f.set_push(true);
+        f.invoke_plan_changed();
+        assert!(matches!(log.borrow().last(), Some(Command::FlowPlan(r)) if !r.push));
+        f.invoke_action("finish:feature".into());
+        f.set_push(true);
+        f.invoke_plan_changed();
+        assert!(matches!(log.borrow().last(), Some(Command::FlowPlan(r)) if !r.push && r.tag.is_empty()));
+    }
+
+    #[test]
+    fn plan_event_fills_steps_and_blocker() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:feature".into());
+        let req = feature_request("feature/login-form");
+        apply(&w, Event::FlowPlan {
+            request: req.clone(),
+            plan: FinishPlan {
+                steps: vec![step("Merge feature/x into develop", "3 commits", false)],
+                blocker: Some(Blocker::Dirty(13)),
+            },
+        });
+        let first = f.get_steps().row_data(0).unwrap();
+        assert_eq!((first.text.as_str(), first.note.as_str(), first.state), ("Merge feature/x into develop", "3 commits", 0));
+        assert_eq!((f.get_blocker_level(), f.get_blocker_title().as_str()), (1, "13 uncommitted changes"));
+        assert_eq!(f.get_blocker_body(), Blocker::Dirty(13).body());
+        assert_eq!(f.get_blocker_files().row_count(), 0);
+    }
+
+    #[test]
+    fn clean_plan_clears_an_earlier_blocker() {
+        let (w, _log) = finish_feature_window(Some(Blocker::Dirty(2)));
+        let f = w.global::<Flow>();
+        assert_eq!(f.get_blocker_level(), 1);
+        apply(&w, Event::FlowPlan { request: feature_request("feature/login-form"), plan: feature_plan(None) });
+        assert_eq!((f.get_blocker_level(), f.get_blocker_title().as_str()), (0, ""));
+        assert_eq!(f.get_steps().row_count(), 3);
+    }
+
+    #[test]
+    fn conflict_plan_is_level_two_with_files() {
+        let conflict = Blocker::Conflict {
+            target: "develop".into(),
+            branch: "feature/login-form".into(),
+            files: vec!["src/controller.rs".into(), "ui/app.slint".into()],
+        };
+        let (w, _log) = finish_feature_window(Some(conflict));
+        let f = w.global::<Flow>();
+        assert_eq!(f.get_blocker_level(), 2);
+        assert_eq!(f.get_blocker_title(), "Cannot merge cleanly");
+        assert_eq!(f.get_blocker_files().row_count(), 2);
+        assert_eq!(f.get_blocker_files().row_data(1).unwrap(), "ui/app.slint");
+    }
+
+    #[test]
+    fn collision_plan_is_level_one_with_files() {
+        let (w, _log) = finish_feature_window(Some(Blocker::Collision(vec!["build.log".into()])));
+        let f = w.global::<Flow>();
+        assert_eq!(f.get_blocker_level(), 1);
+        assert_eq!(f.get_blocker_files().row_count(), 1);
+    }
+
+    #[test]
+    fn stale_plan_is_ignored() {
+        let (w, _log) = flow_window(two_features_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:feature".into());
+        apply(&w, Event::FlowPlan { request: feature_request("feature/other"), plan: feature_plan(Some(Blocker::Busy)) });
+        assert_eq!(f.get_steps().row_count(), 0);
+        assert_eq!(f.get_blocker_level(), 0);
+        // Same branch but a different tick: also stale.
+        let mut req = feature_request("feature/login-form");
+        req.delete_branch = false;
+        apply(&w, Event::FlowPlan { request: req, plan: feature_plan(None) });
+        assert_eq!(f.get_steps().row_count(), 0);
+    }
+
+    #[test]
+    fn plan_for_a_closed_dialog_is_ignored() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:feature".into());
+        f.invoke_cancel();
+        apply(&w, Event::FlowPlan { request: feature_request("feature/login-form"), plan: feature_plan(None) });
+        assert_eq!(f.get_steps().row_count(), 0);
+    }
+
+    #[test]
+    fn ticks_and_picker_resend_plan() {
+        let (w, log) = flow_window(two_features_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:feature".into());
+        f.set_delete_branch(false);
+        f.invoke_plan_changed();
+        assert!(matches!(log.borrow().last(), Some(Command::FlowPlan(r)) if !r.delete_branch));
+
+        f.set_branch("feature/other".into());
+        f.set_tag("stray".into());
+        f.set_message("stray".into());
+        f.invoke_plan_changed();
+        assert_eq!((f.get_tag().as_str(), f.get_message().as_str()), ("", ""));
+        assert!(matches!(
+            log.borrow().last(),
+            Some(Command::FlowPlan(r)) if r.branch == "feature/other" && r.tag.is_empty() && !r.delete_branch
+        ));
+    }
+
+    #[test]
+    fn tag_edits_keep_the_typed_tag() {
+        let (w, log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        f.set_tag("v1.2.0-rc".into());
+        f.invoke_plan_changed();
+        assert_eq!(f.get_tag(), "v1.2.0-rc");
+        assert!(matches!(log.borrow().last(), Some(Command::FlowPlan(r)) if r.tag == "v1.2.0-rc"));
+    }
+
+    #[test]
+    fn typing_a_tag_requests_a_plan_per_edit() {
+        let (w, log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        // The Tag field has the focus with the caret after the default.
+        type_text(&w, "x");
+        assert_eq!(f.get_tag(), "v1.2.0x");
+        assert!(matches!(log.borrow().last(), Some(Command::FlowPlan(r)) if r.tag == "v1.2.0x"));
+    }
+
+    #[test]
+    fn submit_finish_sends_request() {
+        let (w, log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        let req = release_request();
+        apply(&w, Event::FlowPlan { request: req.clone(), plan: FinishPlan { steps: release_steps(), blocker: None } });
+        f.invoke_submit_finish();
+        assert!(matches!(log.borrow().last(), Some(Command::FlowFinish(r)) if *r == req));
+    }
+
+    #[test]
+    fn submit_finish_refused_while_blocked_or_unplanned() {
+        let (w, log) = finish_feature_window(Some(Blocker::Dirty(1)));
+        let f = w.global::<Flow>();
+        f.invoke_submit_finish();
+        f.invoke_action("finish:feature".into());
+        log.borrow_mut().clear();
+        // No plan has arrived for this request yet.
+        f.invoke_submit_finish();
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+    }
+
+    #[test]
+    fn return_finishes_when_allowed() {
+        let (w, log) = finish_feature_window(None);
+        press(&w, Key::Return.into(), false);
+        assert!(matches!(log.borrow().last(), Some(Command::FlowFinish(r)) if *r == feature_request("feature/login-form")));
+    }
+
+    #[test]
+    fn return_and_escape_close_a_conflict() {
+        let conflict = Blocker::Conflict { target: "develop".into(), branch: "feature/login-form".into(), files: vec![] };
+        let (w, log) = finish_feature_window(Some(conflict.clone()));
+        let f = w.global::<Flow>();
+        press(&w, Key::Return.into(), false);
+        assert_eq!(f.get_dialog(), 0);
+        f.invoke_action("finish:feature".into());
+        apply(&w, Event::FlowPlan { request: feature_request("feature/login-form"), plan: feature_plan(Some(conflict)) });
+        press(&w, Key::Escape.into(), false);
+        assert_eq!(f.get_dialog(), 0);
+        assert!(!log.borrow().iter().any(|c| matches!(c, Command::FlowFinish(_))));
+    }
+
+    #[test]
+    fn return_does_nothing_while_finish_is_blocked() {
+        let (w, log) = finish_feature_window(Some(Blocker::Dirty(3)));
+        press(&w, Key::Return.into(), false);
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+        assert_eq!(w.global::<Flow>().get_dialog(), 3);
+    }
+
+    #[test]
+    fn shortcuts_are_ignored_behind_a_finish_dialog() {
+        let (w, log) = keyboard_window();
+        apply(&w, Event::Flow(flow_state()));
+        w.global::<Flow>().invoke_action("finish:feature".into());
+        log.borrow_mut().clear();
+        press(&w, "s".into(), false);
+        press(&w, "u".into(), false);
+        press(&w, "k".into(), true);
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+        assert!(!w.get_switcher_open());
+
+        // The dialog lost the focus to the window shortcuts (closing a
+        // discard prompt focuses them): still nothing behind the dialog acts.
+        w.set_discard_kind(1);
+        slint::platform::update_timers_and_animations();
+        w.set_discard_kind(0);
+        slint::platform::update_timers_and_animations();
+        press(&w, "s".into(), false);
+        press(&w, "u".into(), false);
+        press(&w, "k".into(), true);
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+        assert!(!w.get_switcher_open());
+        assert_eq!(w.global::<Flow>().get_dialog(), 3);
+    }
+
+    #[test]
+    fn pushing_then_failed_then_retry_and_close() {
+        let (w, log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        apply(&w, Event::FlowPlan { request: release_request(), plan: FinishPlan { steps: release_steps(), blocker: None } });
+        apply(&w, Event::FlowPushing);
+        assert_eq!(f.get_dialog(), 4);
+        let states: Vec<i32> = f.get_steps().iter().map(|s| s.state).collect();
+        assert_eq!(states, vec![1, 1, 1, 1, 1, 2, 2]);
+        apply(&w, Event::FlowPushFailed("rejected".into()));
+        assert_eq!((f.get_dialog(), f.get_push_reason().as_str()), (5, "rejected"));
+        let states: Vec<i32> = f.get_steps().iter().map(|s| s.state).collect();
+        assert_eq!(states, vec![1, 1, 1, 1, 1, 3, 3]);
+        f.invoke_retry_push();
+        assert!(matches!(log.borrow().last(), Some(Command::FlowRetryPush)));
+        apply(&w, Event::FlowPushing);
+        assert_eq!(f.get_dialog(), 4);
+        assert_eq!(f.get_steps().row_data(6).unwrap().state, 2);
+        apply(&w, Event::FlowPushFailed("main [rejected] (fetch first)".into()));
+        f.invoke_close_push_failed();
+        assert!(matches!(log.borrow().last(), Some(Command::FlowDropPush)));
+    }
+
+    #[test]
+    fn retry_clears_an_old_error() {
+        let (w, _log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        apply(&w, Event::FlowPushing);
+        apply(&w, Event::FlowPushFailed("rejected".into()));
+        apply(&w, Event::Error("could not refresh".into()));
+        assert_eq!(f.get_error(), "could not refresh");
+        f.invoke_retry_push();
+        assert_eq!(f.get_error(), "");
+    }
+
+    #[test]
+    fn pushing_ignores_escape_and_return() {
+        let (w, log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        apply(&w, Event::FlowPlan { request: release_request(), plan: FinishPlan { steps: release_steps(), blocker: None } });
+        apply(&w, Event::FlowPushing);
+        log.borrow_mut().clear();
+        press(&w, Key::Escape.into(), false);
+        press(&w, Key::Return.into(), false);
+        press(&w, "s".into(), false);
+        assert_eq!(f.get_dialog(), 4);
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+    }
+
+    #[test]
+    fn push_failed_escape_closes_and_return_retries() {
+        let (w, log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        apply(&w, Event::FlowPushing);
+        apply(&w, Event::FlowPushFailed("rejected".into()));
+        log.borrow_mut().clear();
+        press(&w, Key::Return.into(), false);
+        assert!(matches!(log.borrow().as_slice(), [Command::FlowRetryPush]));
+        press(&w, Key::Escape.into(), false);
+        assert!(matches!(log.borrow().last(), Some(Command::FlowDropPush)));
+    }
+
+    #[test]
+    fn repo_opened_closes_a_push_dialog() {
+        let (w, _log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        apply(&w, Event::FlowPushing);
+        opened(&w, "/w/other", &["/w/other"]);
+        assert_eq!(f.get_dialog(), 0);
+        apply(&w, Event::Flow(release_state()));
+        f.invoke_action("finish:release".into());
+        apply(&w, Event::FlowPushing);
+        apply(&w, Event::FlowPushFailed("rejected".into()));
+        opened(&w, "/w/other", &["/w/other"]);
+        assert_eq!((f.get_dialog(), f.get_push_reason().as_str()), (0, ""));
+        assert_eq!(f.get_steps().row_count(), 0);
+    }
+
+    #[test]
+    fn notice_is_dismissed_and_cleared_by_errors() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        apply(&w, Event::FlowDone("Finished feature/x. Merged into develop.".into()));
+        assert_eq!(f.get_notice(), "Finished feature/x. Merged into develop.");
+        f.invoke_dismiss_notice();
+        assert_eq!(f.get_notice(), "");
+        apply(&w, Event::FlowDone("x".into()));
+        assert_eq!(f.get_notice(), "x");
+        apply(&w, Event::Error("boom".into()));
+        assert_eq!(f.get_notice(), "");
+        assert_eq!(w.get_error_text(), "boom");
     }
 }

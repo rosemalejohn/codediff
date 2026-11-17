@@ -2,7 +2,7 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon, FlatButton, CountBadge, Kbd } from "theme.slint";
 import { FileRow, CommitRow, ChangesSidebar, HistorySidebar, FileStrip } from "sidebar.slint";
-import { RepoMenu, ErrorBanner, ConfirmDialog } from "dialogs.slint";
+import { RepoMenu, ErrorBanner, NoticeBanner, ConfirmDialog } from "dialogs.slint";
 import { SwitcherItem, Switcher } from "switcher.slint";
 import { SegData, CellData, RowData, DiffPane } from "diffview.slint";
 import { FlowStep, Flow, FlowMenu, FlowDialog } from "flow.slint";
@@ -498,7 +498,8 @@ export component AppWindow inherits Window {
         width: 0px;
         height: 0px;
         key-pressed(event) => {
-            if root.discard-kind != 0 {
+            // No window shortcut acts behind a modal dialog.
+            if root.discard-kind != 0 || Flow.dialog != 0 {
                 return reject;
             }
             // Cmd+K: project switcher, also on the welcome screen.
@@ -517,9 +518,7 @@ export component AppWindow inherits Window {
             // Option+Cmd+F: Git Flow Next Action. Option turns f into U+0192.
             if event.modifiers.control && event.modifiers.alt
                 && (event.text == "f" || event.text == "F" || event.text == "\u{192}") {
-                if Flow.dialog == 0 {
-                    root.show-flow-switcher();
-                }
+                root.show-flow-switcher();
                 return accept;
             }
             // Up/Down: files in Changes, commits in History.
@@ -994,6 +993,14 @@ export component AppWindow inherits Window {
                     text: root.error-text;
                     dismiss => {
                         root.dismiss-error();
+                    }
+                }
+
+                if Flow.notice != "": NoticeBanner {
+                    text: Flow.notice;
+                    dismiss => {
+                        Flow.dismiss-notice();
+                        keys.focus();
                     }
                 }
 
