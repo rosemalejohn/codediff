@@ -5,7 +5,7 @@ import { FileRow, CommitRow, ChangesSidebar, HistorySidebar, FileStrip } from "s
 import { RepoMenu, ErrorBanner, ConfirmDialog } from "dialogs.slint";
 import { SwitcherItem, Switcher } from "switcher.slint";
 import { SegData, CellData, RowData, DiffPane } from "diffview.slint";
-import { FlowStep, Flow, FlowMenu } from "flow.slint";
+import { FlowStep, Flow, FlowMenu, FlowDialog } from "flow.slint";
 
 export { FileRow, CommitRow, SegData, CellData, RowData, FlowStep, Flow }
 
@@ -485,6 +485,14 @@ export component AppWindow inherits Window {
         }
     }
 
+    // Window shortcuts work again once a flow dialog closes.
+    property <int> flow-dialog: Flow.dialog;
+    changed flow-dialog => {
+        if root.flow-dialog == 0 {
+            keys.focus();
+        }
+    }
+
     // Window-level shortcuts. Slint reports the macOS Command key as `control`.
     keys := FocusScope {
         width: 0px;
@@ -731,11 +739,11 @@ export component AppWindow inherits Window {
 
                         flow-menu := FlowMenu {
                             // Act first: close() tears down this item, so
-                            // anything after it would never run.
+                            // anything after it would never run. The dialog
+                            // the action opens takes the focus.
                             action(key) => {
                                 Flow.action(key);
                                 flow-popup.close();
-                                keys.focus();
                             }
                             next-action => {
                                 root.show-flow-switcher();
@@ -1147,6 +1155,11 @@ export component AppWindow inherits Window {
         confirm => {
             root.confirm-discard();
         }
+    }
+
+    if Flow.dialog != 0: FlowDialog {
+        width: root.width;
+        height: root.height;
     }
 
     // Error banner also visible on the welcome screen (e.g. not a Git repo).

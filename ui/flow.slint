@@ -1,5 +1,5 @@
-// Git Flow: the shared state global and the top bar menu.
-import { Theme, Kbd } from "theme.slint";
+// Git Flow: the shared state global, the top bar menu and the dialogs.
+import { Theme, Icons, Icon, FlatButton, Kbd } from "theme.slint";
 import { SwitcherItem } from "switcher.slint";
 
 // One line of a finish plan. state: 0 pending, 1 done, 2 running, 3 failed.
@@ -251,6 +251,706 @@ export component FlowMenu inherits Rectangle {
             hint: root.ready && Flow.hotfix == "" ? "none open" : "";
             clicked => {
                 root.action("finish:hotfix:" + Flow.hotfix);
+            }
+        }
+    }
+}
+
+
+// ---- dialog controls ----
+
+// A labeled row: label on the left (or above when `stacked`), the control,
+// then a hint line under the control.
+component FlowRow inherits VerticalLayout {
+    in property <string> label;
+    in property <length> label-width: 124px;
+    in property <bool> stacked: false;
+    in property <string> hint;
+    in property <brush> hint-color: Theme.text-muted;
+
+    spacing: 5px;
+
+    if root.stacked: Text {
+        text: root.label;
+        color: Theme.text-muted;
+        font-size: Theme.small-font-size + 1px;
+    }
+
+    HorizontalLayout {
+        spacing: 10px;
+
+        if !root.stacked: Text {
+            min-width: root.label-width;
+            max-width: root.label-width;
+            text: root.label;
+            color: Theme.text-muted;
+            font-size: Theme.small-font-size + 1.5px;
+            vertical-alignment: center;
+        }
+
+        @children
+    }
+
+    if root.hint != "": HorizontalLayout {
+        padding-left: root.stacked ? 0px : root.label-width + 10px;
+
+        Text {
+            text: root.hint;
+            color: root.hint-color;
+            font-size: Theme.small-font-size + 0.5px;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// The input box look shared by FlowField and FlowPicker.
+component FlowBox inherits Rectangle {
+    in property <bool> focused;
+    in property <bool> invalid;
+
+    height: 30px;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius;
+    background: Theme.window-bg;
+    border-width: 1px;
+    border-color: root.invalid ? Theme.letter-deleted : root.focused ? Theme.accent : Theme.button-border;
+
+    // Focus ring outside the border.
+    if root.focused && !root.invalid: Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: Theme.radius + 3px;
+        border-width: 3px;
+        border-color: Theme.accent-soft;
+    }
+
+    @children
+}
+
+// Labeled one-line text field. `prefix` is fixed text shown inside the box
+// before what is typed; `error`, when not empty, replaces the hint and marks
+// the box.
+export component FlowField inherits FlowRow {
+    in-out property <string> text;
+    in property <string> note;
+    in property <bool> note-positive: false;
+    in property <string> prefix;
+    in property <string> placeholder;
+    in property <string> icon;
+    in property <string> error;
+    // Takes keyboard focus when created.
+    in property <bool> autofocus: false;
+    callback edited(string);
+
+    public function focus-input() {
+        input.focus();
+    }
+
+    init => {
+        if root.autofocus {
+            input.focus();
+        }
+    }
+
+    hint: root.error != "" ? root.error : root.note;
+    hint-color: root.error != "" ? Theme.letter-deleted : root.note-positive ? Theme.letter-added : Theme.text-muted;
+
+    FlowBox {
+        focused: input.has-focus;
+        invalid: root.error != "";
+
+        // Clicks on the padding focus the input too.
+        TouchArea {
+            mouse-cursor: MouseCursor.text;
+            clicked => {
+                input.focus();
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 9px;
+            padding-right: 9px;
+            spacing: 6px;
+
+            if root.icon != "": Icon {
+                y: (parent.height - self.height) / 2;
+                size: 13px;
+                glyph: root.icon;
+                tint: Theme.text-muted;
+            }
+
+            // No gap between the prefix and the typed name.
+            HorizontalLayout {
+                spacing: 0px;
+
+                if root.prefix != "": Text {
+                    text: root.prefix;
+                    color: Theme.text-muted;
+                    font-family: Theme.mono-font;
+                    font-size: Theme.mono-font-size;
+                    vertical-alignment: center;
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+
+                    if input.text == "" && root.placeholder != "": Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: root.placeholder;
+                        color: Theme.text-faint;
+                        font-family: Theme.mono-font;
+                        font-size: Theme.mono-font-size;
+                        vertical-alignment: center;
+                    }
+
+                    input := TextInput {
+                        width: parent.width;
+                        height: parent.height;
+                        text <=> root.text;
+                        single-line: true;
+                        color: Theme.text-strong;
+                        font-family: Theme.mono-font;
+                        font-size: Theme.mono-font-size;
+                        vertical-alignment: center;
+                        edited => {
+                            root.edited(self.text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component FlowPickerItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> current;
+    callback clicked();
+
+    height: 28px;
+    border-radius: Theme.radius-sm + 1px;
+    background: touch.has-hover ? Theme.row-selected : transparent;
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 10px;
+        spacing: 6px;
+
+        Rectangle {
+            width: 13px;
+
+            if root.current: Icon {
+                y: (parent.height - self.height) / 2;
+                size: 13px;
+                glyph: Icons.check;
+                tint: Theme.accent;
+            }
+        }
+
+        Text {
+            text: root.text;
+            color: touch.has-hover ? Theme.row-selected-text : Theme.text;
+            font-family: Theme.mono-font;
+            font-size: Theme.mono-font-size;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Labeled picker: the current value in a box, a click lists `options`.
+export component FlowPicker inherits FlowRow {
+    in property <[string]> options;
+    in-out property <string> value;
+    in property <string> icon: Icons.branch;
+    callback picked(string);
+
+    FlowBox {
+        focused: popup.is-open;
+
+        HorizontalLayout {
+            padding-left: 9px;
+            padding-right: 8px;
+            spacing: 6px;
+
+            if root.icon != "": Icon {
+                y: (parent.height - self.height) / 2;
+                size: 13px;
+                glyph: root.icon;
+                tint: Theme.text-muted;
+            }
+
+            Text {
+                horizontal-stretch: 1;
+                text: root.value;
+                color: Theme.text-strong;
+                font-family: Theme.mono-font;
+                font-size: Theme.mono-font-size;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            Icon {
+                y: (parent.height - self.height) / 2;
+                size: 12px;
+                glyph: Icons.chevron-down;
+                tint: Theme.text-muted;
+            }
+        }
+
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                popup.show();
+            }
+        }
+
+        popup := PopupWindow {
+            x: 0px;
+            y: parent.height + 4px;
+            width: parent.width;
+
+            Rectangle {
+                background: Theme.popup-bg;
+                border-color: Theme.border;
+                border-width: 1px;
+                border-radius: Theme.radius-lg - 2px;
+                drop-shadow-blur: 18px;
+                drop-shadow-offset-y: 4px;
+                drop-shadow-color: Theme.shadow;
+
+                VerticalLayout {
+                    padding: 5px;
+
+                    for option in root.options: FlowPickerItem {
+                        text: option;
+                        current: option == root.value;
+                        // Act first: close() may tear down this item.
+                        clicked => {
+                            root.value = option;
+                            root.picked(option);
+                            popup.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Tick box with a label. A disabled box shows `reason` after the label.
+export component FlowCheck inherits Rectangle {
+    in property <string> text;
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    in property <string> reason;
+    callback toggled(bool);
+
+    min-height: 20px;
+
+    HorizontalLayout {
+        spacing: 8px;
+
+        Rectangle {
+            y: (parent.height - self.height) / 2;
+            width: 15px;
+            height: 15px;
+            border-radius: Theme.radius-sm;
+            background: root.checked && root.enabled ? Theme.accent : Theme.window-bg;
+            border-width: root.checked && root.enabled ? 0px : 1px;
+            border-color: Theme.button-border;
+            opacity: root.enabled ? 1.0 : 0.5;
+
+            if root.checked && root.enabled: Icon {
+                x: 1.5px;
+                y: 1.5px;
+                size: 12px;
+                glyph: Icons.check;
+                tint: Theme.accent-text;
+            }
+        }
+
+        Text {
+            text: root.text;
+            color: root.enabled ? Theme.text : Theme.text-faint;
+            font-size: Theme.font-size;
+            vertical-alignment: center;
+        }
+
+        if root.reason != "" && !root.enabled: Text {
+            horizontal-stretch: 1;
+            text: root.reason;
+            color: Theme.text-faint;
+            font-size: Theme.small-font-size + 0.5px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+// Branch name on a tinted chip; `new` marks a branch about to be created.
+component FlowPill inherits Rectangle {
+    in property <string> text;
+    in property <bool> new: false;
+
+    height: 22px;
+    width: layout.preferred-width;
+    border-radius: Theme.radius-sm + 1px;
+    background: root.new ? Theme.accent-soft : Theme.tab-on-bg;
+
+    layout := HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 8px;
+        spacing: 5px;
+
+        Icon {
+            y: (parent.height - self.height) / 2;
+            size: 12px;
+            glyph: Icons.branch;
+            tint: root.new ? Theme.accent : Theme.text-muted;
+        }
+
+        Text {
+            text: root.text;
+            color: Theme.text-strong;
+            font-family: Theme.mono-font;
+            font-size: Theme.mono-font-size;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Heading for a group of fields.
+component FlowSubhead inherits Text {
+    color: Theme.text-muted;
+    font-size: Theme.small-font-size;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+}
+
+// ---- dialog ----
+
+// The modal Git Flow dialog, one state per Flow.dialog: 1 initialize,
+// 2 start. Return runs the primary action when it is enabled; Escape and
+// Cancel call Flow.cancel().
+export component FlowDialog inherits Rectangle {
+    property <string> start-prefix: Flow.kind == 0 ? Flow.feature-prefix
+        : Flow.kind == 1 ? Flow.release-prefix : Flow.hotfix-prefix;
+    property <string> start-word: Flow.kind == 0 ? "Feature" : Flow.kind == 1 ? "Release" : "Hotfix";
+    property <bool> init-ok: Flow.init-production != Flow.init-develop
+        && Flow.init-production != "" && Flow.init-develop != "" && Flow.init-feature != ""
+        && Flow.init-release != "" && Flow.init-hotfix != "";
+    property <bool> start-ok: Flow.name != "" && Flow.start-error == "";
+    property <bool> can-submit: Flow.dialog == 1 ? root.init-ok : Flow.dialog == 2 ? root.start-ok : false;
+
+    function submit() {
+        if !root.can-submit {
+            return;
+        }
+        if Flow.dialog == 1 {
+            Flow.submit-init();
+        } else if Flow.dialog == 2 {
+            Flow.submit-start();
+        }
+    }
+
+    background: Theme.scrim;
+
+    // Swallows clicks and scrolling so nothing behind the dialog reacts.
+    TouchArea {
+        scroll-event(event) => {
+            accept
+        }
+    }
+
+    FocusScope {
+        // Clicks keep the focus where it is (in a text field).
+        focus-on-click: false;
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                Flow.cancel();
+                return accept;
+            }
+            if event.text == Key.Return {
+                root.submit();
+                return accept;
+            }
+            reject
+        }
+
+        card := Rectangle {
+            width: min(460px, root.width - 40px);
+            height: layout.preferred-height;
+            x: (root.width - self.width) / 2;
+            y: (root.height - self.height) / 2;
+            background: Theme.popup-bg;
+            border-color: Theme.border;
+            border-width: 1px;
+            border-radius: Theme.radius-lg + 2px;
+            drop-shadow-blur: 32px;
+            drop-shadow-offset-y: 10px;
+            drop-shadow-color: Theme.shadow;
+
+            // Clicks inside the card do not reach the scrim.
+            TouchArea { }
+
+            layout := VerticalLayout {
+                padding: 20px;
+                spacing: 14px;
+
+                HorizontalLayout {
+                    spacing: 12px;
+
+                    Rectangle {
+                        width: 36px;
+                        height: 36px;
+                        border-radius: 18px;
+                        background: Theme.accent-soft;
+
+                        Icon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            size: 18px;
+                            glyph: Icons.flow;
+                            tint: Theme.accent;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 3px;
+
+                        Text {
+                            text: Flow.dialog == 1 ? "Initialize Git Flow" : "Start New " + root.start-word;
+                            color: Theme.text-strong;
+                            font-size: Theme.title-font-size;
+                            font-weight: 600;
+                        }
+
+                        if Flow.dialog == 1: Text {
+                            text: "Pick the two long-lived branches and the naming prefixes.";
+                            color: Theme.text-muted;
+                            font-size: Theme.small-font-size + 1px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                if Flow.dialog == 1: VerticalLayout {
+                    spacing: 14px;
+
+                    FlowPicker {
+                        label: "Production branch";
+                        hint: "Releases and hotfixes merge here.";
+                        options: Flow.branches;
+                        value <=> Flow.init-production;
+                        // The list popup took the focus; give it back.
+                        picked => {
+                            develop-field.focus-input();
+                        }
+                    }
+
+                    develop-field := FlowField {
+                        label: "Development branch";
+                        icon: Icons.branch;
+                        text <=> Flow.init-develop;
+                        note: Flow.init-develop-new ? "New branch, created from " + Flow.init-production + "."
+                            : "Existing branch.";
+                        note-positive: Flow.init-develop-new;
+                        autofocus: true;
+                        edited(text) => {
+                            Flow.init-develop-edited(text);
+                        }
+                    }
+
+                    FlowSubhead {
+                        text: "BRANCH PREFIXES";
+                    }
+
+                    GridLayout {
+                        spacing-horizontal: 14px;
+                        spacing-vertical: 10px;
+
+                        Row {
+                            FlowField {
+                                stacked: true;
+                                label: "Feature";
+                                text <=> Flow.init-feature;
+                            }
+
+                            FlowField {
+                                stacked: true;
+                                label: "Release";
+                                text <=> Flow.init-release;
+                            }
+                        }
+
+                        Row {
+                            FlowField {
+                                stacked: true;
+                                label: "Hotfix";
+                                text <=> Flow.init-hotfix;
+                            }
+
+                            FlowField {
+                                stacked: true;
+                                label: "Version tag";
+                                placeholder: "none";
+                                text <=> Flow.init-tag;
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Icon {
+                            y: (parent.height - self.height) / 2;
+                            size: 14px;
+                            glyph: Icons.info;
+                            tint: Theme.text-muted;
+                        }
+
+                        Text {
+                            horizontal-stretch: 1;
+                            text: "Saved in .git/config under gitflow.*, the keys Sourcetree and git-flow read.";
+                            color: Theme.text-muted;
+                            font-size: Theme.small-font-size + 1px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                if Flow.dialog == 2: VerticalLayout {
+                    spacing: 14px;
+
+                    FlowField {
+                        label: Flow.kind == 0 ? "Feature name" : "Version";
+                        prefix: root.start-prefix;
+                        text <=> Flow.name;
+                        note: Flow.kind == 0 ? "" : Flow.latest-tag;
+                        error: Flow.start-error;
+                        autofocus: true;
+                        edited(text) => {
+                            Flow.name-edited(text);
+                        }
+                    }
+
+                    if Flow.start-error == "": Rectangle {
+                        height: plan.preferred-height;
+                        background: Theme.bar-bg;
+                        border-color: Theme.border;
+                        border-width: 1px;
+                        border-radius: Theme.radius + 2px;
+
+                        plan := VerticalLayout {
+                            padding-top: 11px;
+                            padding-bottom: 11px;
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: 9px;
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+
+                                FlowPill {
+                                    text: Flow.kind == 2 ? Flow.production : Flow.develop;
+                                }
+
+                                Icon {
+                                    y: (parent.height - self.height) / 2;
+                                    size: 14px;
+                                    glyph: Icons.arrow-right;
+                                    tint: Theme.text-muted;
+                                }
+
+                                FlowPill {
+                                    text: root.start-prefix + Flow.name;
+                                    new: true;
+                                }
+                            }
+
+                            if Flow.kind == 0: Text {
+                                text: "Creates the branch from the tip of " + Flow.develop
+                                    + " and switches to it. Uncommitted changes come along.";
+                                color: Theme.text-muted;
+                                font-size: Theme.small-font-size + 1px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                if Flow.error != "": Rectangle {
+                    height: error-layout.preferred-height;
+                    background: Theme.error-bg;
+                    border-color: Theme.error-border;
+                    border-width: 1px;
+                    border-radius: Theme.radius + 2px;
+
+                    error-layout := HorizontalLayout {
+                        padding-top: 10px;
+                        padding-bottom: 10px;
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 10px;
+
+                        Icon {
+                            glyph: Icons.alert;
+                            tint: Theme.error-text;
+                        }
+
+                        Text {
+                            horizontal-stretch: 1;
+                            text: Flow.error;
+                            color: Theme.error-text;
+                            font-size: Theme.font-size;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    padding-top: 4px;
+
+                    FlatButton {
+                        text: "Cancel";
+                        clicked => {
+                            Flow.cancel();
+                        }
+                    }
+
+                    FlatButton {
+                        text: Flow.dialog == 1 ? "Initialize" : "Start " + root.start-word;
+                        primary: true;
+                        enabled: root.can-submit;
+                        clicked => {
+                            root.submit();
+                        }
+                    }
+                }
             }
         }
     }

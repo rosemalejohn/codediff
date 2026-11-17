@@ -1,7 +1,7 @@
 //! Maps controller Events onto `AppWindow` properties and UI callbacks onto Commands.
 use crate::branch::{BranchInfo, HeadInfo};
 use crate::controller::{Command, DiffView, Event, RangeInfo, Selection};
-use crate::flow::{next_actions, FlowKind, FlowState};
+use crate::flow::{next_actions, FlowConfig, FlowKind, FlowState};
 use crate::history::relative_time;
 use crate::highlight::{StyledCell, StyledRow};
 use crate::sbs::{ExpandDir, GapCtl};
@@ -124,7 +124,14 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
             window.set_unstaged(rows(&lists.unstaged, SIDE_UNSTAGED));
             mark_selection(window);
         }
-        Event::Error(msg) => window.set_error_text(msg.into()),
+        Event::Error(msg) => {
+            // An open flow dialog shows it too, instead of waiting silently.
+            let f = window.global::<Flow>();
+            if f.get_dialog() != FLOW_DIALOG_NONE {
+                f.set_error(msg.as_str().into());
+            }
+            window.set_error_text(msg.into());
+        }
         Event::Head(head) => {
             let (name, detached) = match head {
                 HeadInfo::Branch(b) => (b, false),
@@ -181,13 +188,15 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
             }
         }
         Event::Flow(state) => apply_flow(window, &state, now),
-        // The flow dialogs (Tasks 9 and 10) map these.
-        Event::FlowStartCheck { .. }
-        | Event::FlowPlan { .. }
-        | Event::FlowPushing
-        | Event::FlowPushFailed(_)
-        | Event::FlowDone(_)
-        | Event::FlowFailed(_) => {}
+        Event::FlowStartCheck { kind, name, error } => apply_start_check(window, kind, &name, error),
+        Event::FlowDone(text) => {
+            let f = window.global::<Flow>();
+            f.set_dialog(FLOW_DIALOG_NONE);
+            f.set_notice(text.into());
+        }
+        Event::FlowFailed(text) => window.global::<Flow>().set_error(text.into()),
+        // The finish dialog (Task 10) maps these.
+        Event::FlowPlan { .. } | Event::FlowPushing | Event::FlowPushFailed(_) => {}
     }
 }
 
@@ -786,7 +795,113 @@ fn flow_action(window: &AppWindow, key: &str) {
     if let Some(kind) = kind {
         f.set_kind(flow_kind_index(kind));
     }
+    match dialog {
+        // While not initialized, the names hold the draft config.
+        FLOW_DIALOG_INIT => {
+            f.set_init_production(f.get_production());
+            f.set_init_develop(f.get_develop());
+            f.set_init_feature(f.get_feature_prefix());
+            f.set_init_release(f.get_release_prefix());
+            f.set_init_hotfix(f.get_hotfix_prefix());
+            f.set_init_tag(f.get_tag_prefix());
+            f.set_init_develop_new(!flow_has_branch(window, &f.get_develop()));
+            f.set_error(SharedString::new());
+        }
+        FLOW_DIALOG_START => {
+            f.set_name(SharedString::new());
+            f.set_start_error(SharedString::new());
+            f.set_error(SharedString::new());
+        }
+        _ => {}
+    }
     f.set_dialog(dialog);
+}
+
+fn flow_has_branch(window: &AppWindow, name: &str) -> bool {
+    window.global::<Flow>().get_branches().iter().any(|b| b == name)
+}
+
+/// The kind the open dialog works on.
+fn flow_dialog_kind(window: &AppWindow) -> FlowKind {
+    match window.global::<Flow>().get_kind() {
+        1 => FlowKind::Release,
+        2 => FlowKind::Hotfix,
+        _ => FlowKind::Feature,
+    }
+}
+
+fn flow_init_config(window: &AppWindow) -> FlowConfig {
+    let f = window.global::<Flow>();
+    FlowConfig {
+        production: f.get_init_production().into(),
+        develop: f.get_init_develop().into(),
+        feature: f.get_init_feature().into(),
+        release: f.get_init_release().into(),
+        hotfix: f.get_init_hotfix().into(),
+        version_tag: f.get_init_tag().into(),
+    }
+}
+
+/// Shows the reply to `Command::FlowCheckStart` unless the name changed
+/// since. The empty-name error is left out: the disabled button says it.
+fn apply_start_check(window: &AppWindow, kind: FlowKind, name: &str, error: Option<String>) {
+    let f = window.global::<Flow>();
+    if f.get_dialog() != FLOW_DIALOG_START || kind != flow_dialog_kind(window) || name != f.get_name().as_str() {
+        return;
+    }
+    let error = if name.is_empty() { String::new() } else { error.unwrap_or_default() };
+    f.set_start_error(error.into());
+}
+
+fn wire_flow(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
+    let f = window.global::<Flow>();
+
+    let weak = window.as_weak();
+    f.on_action(move |key| {
+        if let Some(w) = weak.upgrade() {
+            flow_action(&w, &key);
+        }
+    });
+
+    let weak = window.as_weak();
+    f.on_cancel(move || {
+        if let Some(w) = weak.upgrade() {
+            w.global::<Flow>().set_dialog(FLOW_DIALOG_NONE);
+        }
+    });
+
+    let weak = window.as_weak();
+    f.on_init_develop_edited(move |text| {
+        if let Some(w) = weak.upgrade() {
+            let new = !flow_has_branch(&w, &text);
+            w.global::<Flow>().set_init_develop_new(new);
+        }
+    });
+
+    let s = send.clone();
+    let weak = window.as_weak();
+    f.on_submit_init(move || {
+        if let Some(w) = weak.upgrade() {
+            s(Command::FlowInit(flow_init_config(&w)));
+        }
+    });
+
+    let s = send.clone();
+    let weak = window.as_weak();
+    f.on_name_edited(move |text| {
+        if let Some(w) = weak.upgrade() {
+            w.global::<Flow>().set_name(text.clone());
+            s(Command::FlowCheckStart { kind: flow_dialog_kind(&w), name: text.into() });
+        }
+    });
+
+    let s = send;
+    let weak = window.as_weak();
+    f.on_submit_start(move || {
+        if let Some(w) = weak.upgrade() {
+            s(Command::FlowStart { kind: flow_dialog_kind(&w), name: w.global::<Flow>().get_name().into() });
+        }
+    });
 }
 
 /// Applies a saved appearance choice (System follows macOS).
@@ -843,12 +958,7 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     let s = send.clone();
     window.on_list_branches(move || s(Command::ListBranches));
 
-    let weak = window.as_weak();
-    window.global::<Flow>().on_action(move |key| {
-        if let Some(w) = weak.upgrade() {
-            flow_action(&w, &key);
-        }
-    });
+    wire_flow(window, send.clone());
 
     let s = send.clone();
     window.on_checkout_branch(move |refname| s(Command::Checkout(refname.into())));
@@ -2706,5 +2816,229 @@ mod tests {
         assert_eq!(f.get_current_kind(), -1);
         assert!(f.get_delete_branch());
         assert_eq!(f.get_actions().row_count(), 0);
+    }
+
+    /// Not initialized: default draft names, only `main` exists.
+    fn uninitialized_state() -> FlowState {
+        let mut state = flow_state();
+        state.config = None;
+        state.current = None;
+        state.features = vec![];
+        state.branches = vec!["main".into()];
+        state
+    }
+
+    /// Types `text` one character at a time into the focused element.
+    fn type_text(w: &AppWindow, text: &str) {
+        for c in text.chars() {
+            press(w, c.to_string().into(), false);
+        }
+    }
+
+    #[test]
+    fn init_dialog_prefills_and_submits_config() {
+        let (w, log) = flow_window(uninitialized_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("init".into());
+        assert_eq!(
+            (f.get_dialog(), f.get_init_production().as_str(), f.get_init_develop().as_str(), f.get_init_feature().as_str()),
+            (1, "main", "develop", "feature/")
+        );
+        assert_eq!((f.get_init_release().as_str(), f.get_init_hotfix().as_str(), f.get_init_tag().as_str()), ("release/", "hotfix/", ""));
+        assert!(f.get_init_develop_new());
+        f.set_init_tag("v".into());
+        f.invoke_submit_init();
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::FlowInit(c)] if c.production == "main" && c.develop == "develop" && c.version_tag == "v"
+        ));
+    }
+
+    #[test]
+    fn init_action_clears_an_old_error() {
+        let (w, _log) = flow_window(uninitialized_state());
+        let f = w.global::<Flow>();
+        f.set_error("could not write config".into());
+        f.invoke_action("init".into());
+        assert_eq!(f.get_error(), "");
+    }
+
+    #[test]
+    fn init_develop_hint_tracks_existing_branches() {
+        let (w, _log) = flow_window(uninitialized_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("init".into());
+        f.invoke_init_develop_edited("main".into());
+        assert!(!f.get_init_develop_new());
+        f.invoke_init_develop_edited("dev".into());
+        assert!(f.get_init_develop_new());
+    }
+
+    #[test]
+    fn start_dialog_checks_name_and_submits() {
+        let (w, log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("start:release".into());
+        f.invoke_name_edited("1.2.0".into());
+        assert_eq!(f.get_name(), "1.2.0");
+        assert!(matches!(
+            log.borrow().as_slice(),
+            [Command::FlowCheckStart { kind: FlowKind::Release, name }] if name == "1.2.0"
+        ));
+        apply(&w, Event::FlowStartCheck { kind: FlowKind::Release, name: "1.2".into(), error: Some("stale".into()) });
+        assert_eq!(f.get_start_error(), "");
+        apply(&w, Event::FlowStartCheck { kind: FlowKind::Feature, name: "1.2.0".into(), error: Some("other kind".into()) });
+        assert_eq!(f.get_start_error(), "");
+        apply(&w, Event::FlowStartCheck {
+            kind: FlowKind::Release,
+            name: "1.2.0".into(),
+            error: Some("Tag 1.2.0 already exists.".into()),
+        });
+        assert_eq!(f.get_start_error(), "Tag 1.2.0 already exists.");
+        apply(&w, Event::FlowStartCheck { kind: FlowKind::Release, name: "1.2.0".into(), error: None });
+        assert_eq!(f.get_start_error(), "");
+        f.invoke_submit_start();
+        assert!(matches!(
+            log.borrow().last(),
+            Some(Command::FlowStart { kind: FlowKind::Release, name }) if name == "1.2.0"
+        ));
+    }
+
+    #[test]
+    fn start_check_enter_a_name_shows_as_empty_error() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("start:feature".into());
+        f.invoke_name_edited("".into());
+        apply(&w, Event::FlowStartCheck { kind: FlowKind::Feature, name: "".into(), error: Some("Enter a name.".into()) });
+        assert_eq!(f.get_start_error(), "");
+    }
+
+    #[test]
+    fn start_action_clears_name_and_errors() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.set_name("old".into());
+        f.set_start_error("feature/old already exists.".into());
+        f.set_error("failed".into());
+        f.invoke_action("start:feature".into());
+        assert_eq!((f.get_name().as_str(), f.get_start_error().as_str(), f.get_error().as_str()), ("", "", ""));
+    }
+
+    #[test]
+    fn flow_done_closes_dialog_and_sets_notice() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("start:feature".into());
+        apply(&w, Event::FlowDone("Finished feature/x. Merged into develop.".into()));
+        assert_eq!((f.get_dialog(), f.get_notice().as_str()), (0, "Finished feature/x. Merged into develop."));
+    }
+
+    #[test]
+    fn flow_failed_keeps_dialog_open_with_error() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("start:feature".into());
+        apply(&w, Event::FlowFailed("feature/x already exists.".into()));
+        assert_eq!((f.get_dialog(), f.get_error().as_str()), (2, "feature/x already exists."));
+    }
+
+    #[test]
+    fn cancel_closes_dialog() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("start:feature".into());
+        f.invoke_cancel();
+        assert_eq!(f.get_dialog(), 0);
+    }
+
+    #[test]
+    fn error_event_shows_in_open_flow_dialog() {
+        let (w, _log) = flow_window(uninitialized_state());
+        let f = w.global::<Flow>();
+        apply(&w, Event::Error("could not read config".into()));
+        assert_eq!(f.get_error(), "");
+        f.invoke_action("init".into());
+        apply(&w, Event::Error("could not read config".into()));
+        assert_eq!((f.get_dialog(), f.get_error().as_str()), (1, "could not read config"));
+        assert_eq!(w.get_error_text(), "could not read config");
+    }
+
+    #[test]
+    fn typing_in_start_dialog_checks_name_and_return_starts() {
+        let (w, log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("start:feature".into());
+        type_text(&w, "x");
+        assert_eq!(f.get_name(), "x");
+        assert!(matches!(
+            log.borrow().last(),
+            Some(Command::FlowCheckStart { kind: FlowKind::Feature, name }) if name == "x"
+        ));
+        press(&w, Key::Return.into(), false);
+        assert!(matches!(
+            log.borrow().last(),
+            Some(Command::FlowStart { kind: FlowKind::Feature, name }) if name == "x"
+        ));
+    }
+
+    #[test]
+    fn return_does_nothing_while_start_is_disabled() {
+        let (w, log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("start:feature".into());
+        press(&w, Key::Return.into(), false);
+        type_text(&w, "x");
+        apply(&w, Event::FlowStartCheck { kind: FlowKind::Feature, name: "x".into(), error: Some("feature/x already exists.".into()) });
+        press(&w, Key::Return.into(), false);
+        assert!(!log.borrow().iter().any(|c| matches!(c, Command::FlowStart { .. })));
+        assert_eq!(f.get_dialog(), 2);
+    }
+
+    #[test]
+    fn return_in_init_dialog_initializes() {
+        let (w, log) = flow_window(uninitialized_state());
+        w.global::<Flow>().invoke_action("init".into());
+        press(&w, Key::Return.into(), false);
+        assert!(matches!(log.borrow().as_slice(), [Command::FlowInit(c)] if c.develop == "develop"));
+    }
+
+    #[test]
+    fn return_does_nothing_while_init_is_disabled() {
+        let (w, log) = flow_window(uninitialized_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("init".into());
+        f.set_init_develop("main".into());
+        press(&w, Key::Return.into(), false);
+        f.set_init_develop("develop".into());
+        f.set_init_feature("".into());
+        press(&w, Key::Return.into(), false);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn escape_cancels_dialog_and_gives_shortcuts_back() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("start:feature".into());
+        press(&w, Key::Escape.into(), false);
+        assert_eq!(f.get_dialog(), 0);
+        press_opt_cmd(&w, "f".into());
+        assert!(w.get_switcher_open());
+    }
+
+    #[test]
+    fn dialog_from_next_action_focuses_its_field() {
+        let (w, log) = flow_window(flow_state());
+        press_opt_cmd(&w, "f".into());
+        w.invoke_switcher_filter("hot".into());
+        press(&w, Key::Return.into(), false);
+        let f = w.global::<Flow>();
+        assert_eq!((f.get_dialog(), f.get_kind()), (2, 2));
+        type_text(&w, "1");
+        assert!(matches!(
+            log.borrow().last(),
+            Some(Command::FlowCheckStart { kind: FlowKind::Hotfix, name }) if name == "1"
+        ));
     }
 }

@@ -45,6 +45,9 @@ export global Theme {
     out property <brush> error-bg: dark ? #3a1d21 : #fdecec;
     out property <brush> error-border: dark ? #6b2b32 : #f5c2c2;
     out property <brush> error-text: dark ? #ffcdd0 : #8a1020;
+    out property <brush> warn-bg: dark ? #e5b4541f : #9a64001a;
+    out property <brush> warn-border: dark ? #e5b45459 : #9a640059;
+    out property <brush> warn-text: dark ? #f0d9a3 : #7a5000;
 
     // Git status colors, used for badges and +/- counts.
     out property <brush> letter-added: dark ? #4cc38a : #16803c;
@@ -216,8 +219,10 @@ export component StatusBadge inherits Rectangle {
 // Button in the theme's style. Default is a bordered neutral button;
 // `primary` fills with the accent, `danger` is a red outline that fills on
 // hover (`danger-solid` fills always), `ghost` has no chrome until hovered.
+// A disabled button is dimmed and ignores clicks.
 export component FlatButton inherits Rectangle {
     in property <string> text;
+    in property <bool> enabled: true;
     in property <string> icon;
     in property <bool> primary: false;
     in property <bool> danger: false;
@@ -226,7 +231,7 @@ export component FlatButton inherits Rectangle {
     in property <bool> small: false;
     callback clicked();
 
-    property <bool> hot: touch.has-hover;
+    property <bool> hot: root.enabled && touch.has-hover;
     property <brush> fg: danger-solid ? Theme.danger-text
         : danger ? (hot ? Theme.danger-text : Theme.danger-fg)
         : primary ? Theme.accent-text
@@ -244,7 +249,7 @@ export component FlatButton inherits Rectangle {
         : (hot ? Theme.button-hover : Theme.button-bg);
     border-width: (primary || danger || danger-solid || ghost) ? 0px : 1px;
     border-color: Theme.button-border;
-    opacity: touch.pressed ? 0.85 : 1.0;
+    opacity: !root.enabled ? 0.4 : touch.pressed ? 0.85 : 1.0;
     animate background { duration: Theme.fast; }
 
     layout := HorizontalLayout {
@@ -270,7 +275,8 @@ export component FlatButton inherits Rectangle {
     }
 
     touch := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => {
             root.clicked();
         }
