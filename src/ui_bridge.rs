@@ -176,7 +176,14 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
             if window.get_history_mode() != HIST_RANGE {
                 window.set_range_banner(SharedString::new());
             }
-        }
+        }        // Git Flow events are wired to the window by the UI tasks.
+        Event::Flow(_)
+        | Event::FlowStartCheck { .. }
+        | Event::FlowPlan { .. }
+        | Event::FlowPushing
+        | Event::FlowPushFailed(_)
+        | Event::FlowDone(_)
+        | Event::FlowFailed(_) => {}
     }
 }
 

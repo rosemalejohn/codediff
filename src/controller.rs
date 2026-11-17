@@ -1,6 +1,8 @@
 //! Background worker that owns the repository and turns Commands into Events.
 use crate::branch::{self, BranchInfo, HeadInfo};
 use crate::diff::{diff_stats, file_diff, files_in_target};
+use crate::flow::{self, FlowConfig, FlowKind, FlowState};
+use crate::flow_finish::{self, FinishPlan, FinishRequest, PushSpec};
 use crate::highlight::{Highlighter, StyledRow};
 use crate::history::list_commits;
 use crate::model::{
@@ -10,6 +12,7 @@ use crate::model::{
 use crate::recent::RecentRepos;
 use crate::repo::{open_repo, repo_name};
 use crate::sbs::{build_rows_expanded, ExpandDir, Expansion};
+use crate::push;
 use crate::stage;
 use crate::status::list_status;
 use crate::watch::RepoWatcher;
@@ -85,6 +88,23 @@ pub enum Command {
         fingerprint: u64,
     },
     SetDark(bool),
+    FlowInit(FlowConfig),
+    /// Replies `Event::FlowStartCheck`.
+    FlowCheckStart {
+        kind: FlowKind,
+        name: String,
+    },
+    FlowStart {
+        kind: FlowKind,
+        name: String,
+    },
+    /// Replies `Event::FlowPlan`.
+    FlowPlan(FinishRequest),
+    FlowFinish(FinishRequest),
+    /// Pushes the push kept after `Event::FlowPushFailed` again.
+    FlowRetryPush,
+    /// Forgets that push and reports the finish as not pushed.
+    FlowDropPush,
     Shutdown,
 }
 
@@ -124,6 +144,25 @@ pub enum Event {
     Head(HeadInfo),
     Branches(Vec<BranchInfo>),
     Error(String),
+    /// Git Flow state; emitted on open and whenever it changes.
+    Flow(FlowState),
+    FlowStartCheck {
+        kind: FlowKind,
+        name: String,
+        error: Option<String>,
+    },
+    FlowPlan {
+        request: FinishRequest,
+        plan: FinishPlan,
+    },
+    /// The local finish steps are done and the push is running.
+    FlowPushing,
+    /// Git's reason; the push is kept for `Command::FlowRetryPush`.
+    FlowPushFailed(String),
+    /// The flow dialog closes; non-empty text is the notice to show.
+    FlowDone(String),
+    /// The flow dialog stays open and shows this.
+    FlowFailed(String),
 }
 
 /// Handle to the worker thread. Dropping it shuts the worker down.
@@ -145,6 +184,7 @@ impl Controller {
                     recent_file,
                     hl: Highlighter::new(),
                     dark: false,
+                    git: None,
                     open: None,
                     selection: Selection::None,
                     force_full: false,
@@ -185,6 +225,18 @@ struct OpenRepo {
     seen: HashSet<Oid>,
     /// Last emitted HEAD, to emit `Event::Head` only on change.
     head: Option<HeadInfo>,
+    /// Last emitted Git Flow state, to emit `Event::Flow` only on change.
+    flow: Option<FlowState>,
+    /// A finished release or hotfix whose push failed, kept for a retry.
+    pending_push: Option<PendingPush>,
+}
+
+struct PendingPush {
+    spec: PushSpec,
+    /// Notice when the push is dropped.
+    notice: String,
+    /// Notice when the push succeeds.
+    pushed_notice: String,
 }
 
 struct Worker {
@@ -193,6 +245,8 @@ struct Worker {
     recent_file: PathBuf,
     hl: Highlighter,
     dark: bool,
+    /// The installed `git`, looked up on the first repository open.
+    git: Option<Option<PathBuf>>,
     open: Option<OpenRepo>,
     selection: Selection,
     force_full: bool,
@@ -348,6 +402,13 @@ impl Worker {
                     self.emit_diff();
                 }
             }
+            Command::FlowInit(cfg) => self.flow_init(cfg),
+            Command::FlowCheckStart { kind, name } => self.flow_check_start(kind, name),
+            Command::FlowStart { kind, name } => self.flow_start(kind, name),
+            Command::FlowPlan(req) => self.flow_plan(req),
+            Command::FlowFinish(req) => self.flow_finish(req),
+            Command::FlowRetryPush => self.flow_push(),
+            Command::FlowDropPush => self.flow_drop_push(),
             Command::Shutdown => {}
         }
     }
@@ -361,6 +422,9 @@ impl Worker {
         let watcher = self.report(RepoWatcher::start(root.clone(), move || {
             let _ = tx.send(Command::Refresh);
         }));
+        if self.git.is_none() {
+            self.git = Some(push::find_git());
+        }
         let mut recent = RecentRepos::load_from(&self.recent_file);
         recent.touch(root.clone());
         let _ = recent.save_to(&self.recent_file);
@@ -370,6 +434,8 @@ impl Worker {
             loaded: 0,
             seen: HashSet::new(),
             head: None,
+            flow: None,
+            pending_push: None,
         });
         self.selection = Selection::None;
         self.force_full = false;
@@ -382,6 +448,7 @@ impl Worker {
             recent: recent.paths,
         });
         self.emit_head();
+        self.emit_flow();
         self.emit_status();
         self.emit_history_head(true);
         self.emit(Event::Diff(None));
@@ -453,6 +520,7 @@ impl Worker {
             return;
         }
         self.emit_head();
+        self.emit_flow();
         self.emit_status();
         self.emit_history_head(false);
         if self.follow_head() {
@@ -680,5 +748,130 @@ impl Worker {
             HunkOp::Unstage => stage::unstage_hunk(r, &path, idx, &expected),
             HunkOp::Discard => stage::discard_hunk(r, &path, idx, &expected),
         });
+    }
+
+    // Git Flow
+
+    /// Emits `Event::Flow` when the state differs from the last one emitted.
+    fn emit_flow(&mut self) {
+        let git_found = matches!(self.git, Some(Some(_)));
+        let Some(o) = &mut self.open else { return };
+        let state = match flow::flow_state(&o.repo, git_found) {
+            Ok(s) => s,
+            Err(e) => return self.emit(Event::Error(e.to_string())),
+        };
+        if o.flow.as_ref() != Some(&state) {
+            o.flow = Some(state.clone());
+            self.emit(Event::Flow(state));
+        }
+    }
+
+    /// The open repository and its Git Flow settings; None when no
+    /// repository is open or Git Flow is not initialized.
+    fn flow_config(&self) -> Option<(&Repository, FlowConfig)> {
+        let o = self.open.as_ref()?;
+        let cfg = self.report(flow::load_config(&o.repo))??;
+        Some((&o.repo, cfg))
+    }
+
+    fn flow_init(&mut self, cfg: FlowConfig) {
+        let Some(o) = &self.open else { return };
+        match flow::init(&o.repo, &cfg) {
+            Ok(()) => {
+                self.refresh();
+                self.emit(Event::FlowDone(String::new()));
+            }
+            Err(CoreError::CheckoutConflict) => {
+                // Initialization stands; only the switch to develop failed.
+                self.refresh();
+                self.emit(Event::FlowDone(String::new()));
+                self.emit(Event::Error(CoreError::CheckoutConflict.to_string()));
+            }
+            Err(e) => self.emit(Event::FlowFailed(e.to_string())),
+        }
+    }
+
+    fn flow_check_start(&self, kind: FlowKind, name: String) {
+        let Some((repo, cfg)) = self.flow_config() else { return };
+        let error = flow::start_error(repo, &cfg, kind, &name);
+        self.emit(Event::FlowStartCheck { kind, name, error });
+    }
+
+    fn flow_start(&mut self, kind: FlowKind, name: String) {
+        let Some((repo, cfg)) = self.flow_config() else { return };
+        match flow::start(repo, &cfg, kind, &name) {
+            Ok(()) => {
+                self.refresh();
+                self.emit(Event::FlowDone(String::new()));
+            }
+            Err(e) => self.emit(Event::FlowFailed(e.to_string())),
+        }
+    }
+
+    fn flow_plan(&self, request: FinishRequest) {
+        let Some((repo, cfg)) = self.flow_config() else { return };
+        if let Some(plan) = self.report(flow_finish::plan_finish(repo, &cfg, &request)) {
+            self.emit(Event::FlowPlan { request, plan });
+        }
+    }
+
+    fn flow_finish(&mut self, req: FinishRequest) {
+        // A new finish replaces any pending push.
+        if let Some(o) = &mut self.open {
+            o.pending_push = None;
+        }
+        let Some((repo, cfg)) = self.flow_config() else { return };
+        let outcome = match flow_finish::finish(repo, &cfg, &req) {
+            Ok(o) => o,
+            Err(e) => {
+                self.emit(Event::FlowFailed(e.to_string()));
+                return self.flow_plan(req);
+            }
+        };
+        if req.kind != FlowKind::Feature {
+            self.report(flow::set_push_default(repo, req.push));
+        }
+        let Some(o) = &mut self.open else { return };
+        o.pending_push = outcome.push.map(|spec| PendingPush {
+            spec,
+            notice: outcome.notice.clone(),
+            pushed_notice: outcome.pushed_notice,
+        });
+        self.refresh();
+        if self.has_pending_push() {
+            self.flow_push();
+        } else {
+            self.emit(Event::FlowDone(outcome.notice));
+        }
+    }
+
+    fn has_pending_push(&self) -> bool {
+        self.open.as_ref().is_some_and(|o| o.pending_push.is_some())
+    }
+
+    /// Runs the pending push on this thread. Success forgets it; failure keeps it.
+    fn flow_push(&mut self) {
+        let Some(o) = &self.open else { return };
+        let Some(p) = &o.pending_push else { return };
+        self.emit(Event::FlowPushing);
+        let result = match (&self.git, o.repo.workdir()) {
+            (Some(Some(git)), Some(workdir)) => push::push(git, workdir, &p.spec),
+            (Some(Some(_)), None) => Err("Repository has no working tree.".into()),
+            _ => Err("Git command line tools not found.".into()),
+        };
+        match result {
+            Ok(()) => {
+                let done = self.open.as_mut().and_then(|o| o.pending_push.take());
+                self.emit(Event::FlowDone(done.map(|p| p.pushed_notice).unwrap_or_default()));
+            }
+            Err(reason) => self.emit(Event::FlowPushFailed(reason)),
+        }
+    }
+
+    fn flow_drop_push(&mut self) {
+        let Some(o) = &mut self.open else { return };
+        if let Some(p) = o.pending_push.take() {
+            self.emit(Event::FlowDone(p.notice));
+        }
     }
 }

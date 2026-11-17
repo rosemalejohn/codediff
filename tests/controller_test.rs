@@ -1,13 +1,19 @@
 mod common;
+use codediff::branch::HeadInfo;
 use codediff::controller::{Command, Controller, Event, Selection};
+use codediff::flow::{self, FlowConfig, FlowKind};
+use codediff::flow_finish::{Blocker, FinishRequest};
 use codediff::model::*;
-use common::TestRepo;
+use common::{git, origin_ref, TestRepo};
 use git2::Oid;
+use tempfile::TempDir;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
+/// For tests that run the real `git push`.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Harness {
     ctl: Controller,
@@ -40,6 +46,11 @@ impl Harness {
 
     /// First event at index >= `from` matching `pred`, waiting up to 2 s.
     fn wait_for(&self, from: usize, pred: impl Fn(&Event) -> bool) -> (usize, Event) {
+        self.wait_within(TIMEOUT, from, pred)
+    }
+
+    /// `wait_for` with an explicit timeout.
+    fn wait_within(&self, timeout: Duration, from: usize, pred: impl Fn(&Event) -> bool) -> (usize, Event) {
         let start = Instant::now();
         loop {
             {
@@ -48,7 +59,7 @@ impl Harness {
                     return (i, ev[i].clone());
                 }
             }
-            if start.elapsed() > TIMEOUT {
+            if start.elapsed() > timeout {
                 panic!("timed out; events: {:#?}", self.events.lock().unwrap());
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -752,4 +763,190 @@ fn open_emits_head_and_checkout_switches_branch() {
     let m = h.mark();
     h.ctl.send(Command::Checkout("refs/heads/feature".into()));
     h.wait_for(m, |e| matches!(e, Event::Head(HeadInfo::Branch(b)) if b == "feature"));
+}
+
+// Git Flow
+
+/// `flow_repo` with `feature/x` started from develop and holding one commit.
+fn feature_repo() -> (TestRepo, FlowConfig) {
+    let (t, cfg) = common::flow_repo();
+    flow::start(&t.repo, &cfg, FlowKind::Feature, "x").unwrap();
+    t.commit_file("x.txt", b"x\n", "work on x");
+    (t, cfg)
+}
+
+/// `with_origin` with `release/1.2.0` started and holding one commit.
+fn release_repo() -> (TestRepo, FlowConfig, TempDir) {
+    let (t, cfg, bare) = common::with_origin();
+    flow::start(&t.repo, &cfg, FlowKind::Release, "1.2.0").unwrap();
+    t.commit_file("r.txt", b"r\n", "prepare 1.2.0");
+    (t, cfg, bare)
+}
+
+fn push_release_req() -> FinishRequest {
+    FinishRequest {
+        push: true,
+        ..common::release_req("release/1.2.0", "1.2.0", "Release 1.2.0")
+    }
+}
+
+/// Advances origin's production through a second clone, so pushing the local
+/// production is rejected. Returns origin's production tip before the advance.
+fn advance_origin_production(bare: &TempDir, cfg: &FlowConfig) -> Oid {
+    let prod_ref = format!("refs/heads/{}", cfg.production);
+    let old = origin_ref(bare, &prod_ref).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let url = bare.path().to_str().unwrap();
+    git(other.path(), &["clone", "-q", "-b", &cfg.production, url, "."]);
+    std::fs::write(other.path().join("elsewhere.txt"), b"elsewhere\n").unwrap();
+    git(other.path(), &["add", "elsewhere.txt"]);
+    git(other.path(), &["commit", "-q", "-m", "elsewhere"]);
+    git(other.path(), &["push", "-q", "origin", &cfg.production]);
+    assert_ne!(origin_ref(bare, &prod_ref), Some(old));
+    old
+}
+
+/// Runs a pushing release finish against an origin that rejects it.
+/// Returns the mark after `FlowPushFailed`.
+fn finish_with_rejected_push(h: &Harness, t: &TestRepo) -> usize {
+    h.open(t.path());
+    let m = h.mark();
+    h.ctl.send(Command::FlowFinish(push_release_req()));
+    let (i, _) = h.wait_within(PUSH_TIMEOUT, m, |e| matches!(e, Event::FlowPushing));
+    let (j, _) = h.wait_within(PUSH_TIMEOUT, i, |e| matches!(e, Event::FlowPushFailed(r) if !r.is_empty()));
+    j + 1
+}
+
+#[test]
+fn open_emits_flow_state() {
+    let t = TestRepo::new();
+    t.commit_file("a.txt", b"one\n", "first");
+    let h = Harness::new();
+    h.open(t.path());
+    let (_, e) = h.wait_for(0, |e| matches!(e, Event::Flow(_)));
+    let Event::Flow(s) = e else { unreachable!() };
+    assert_eq!(s.config, None);
+}
+
+#[test]
+fn flow_init_start_and_finish_feature() {
+    let t = TestRepo::new();
+    t.commit_file("a.txt", b"one\n", "first");
+    let cfg = common::default_config(&t.head_branch());
+    let h = Harness::new();
+    let m = h.open(t.path());
+
+    h.ctl.send(Command::FlowInit(cfg.clone()));
+    h.wait_for(m, |e| matches!(e, Event::Flow(s) if s.config.is_some()));
+    h.wait_for(m, |e| matches!(e, Event::FlowDone(n) if n.is_empty()));
+
+    let m = h.mark();
+    h.ctl.send(Command::FlowStart { kind: FlowKind::Feature, name: "x".into() });
+    h.wait_for(m, |e| matches!(e, Event::Head(HeadInfo::Branch(b)) if b == "feature/x"));
+    h.wait_for(m, |e| matches!(e, Event::FlowDone(n) if n.is_empty()));
+    assert_eq!(t.head_branch(), "feature/x");
+    t.commit_file("x.txt", b"x\n", "work on x");
+
+    let m = h.mark();
+    h.ctl.send(Command::FlowFinish(common::feature_req("feature/x")));
+    h.wait_for(m, |e| {
+        matches!(e, Event::FlowDone(n) if n == "Finished feature/x. Merged into develop and deleted the branch.")
+    });
+    h.wait_for(m, |e| matches!(e, Event::Head(HeadInfo::Branch(b)) if b == "develop"));
+    assert!(!t.has_branch("feature/x"));
+}
+
+#[test]
+fn flow_check_start_replies() {
+    let (t, _) = common::flow_repo();
+    let h = Harness::new();
+    let m = h.open(t.path());
+    h.ctl.send(Command::FlowCheckStart { kind: FlowKind::Feature, name: "a b".into() });
+    h.wait_for(m, |e| {
+        matches!(e, Event::FlowStartCheck { name, error: Some(m), .. } if name == "a b" && m == "Not a valid branch name.")
+    });
+}
+
+#[test]
+fn flow_plan_replies_with_request() {
+    let (t, _) = feature_repo();
+    let h = Harness::new();
+    let m = h.open(t.path());
+    let req = common::feature_req("feature/x");
+    h.ctl.send(Command::FlowPlan(req.clone()));
+    h.wait_for(m, |e| matches!(e, Event::FlowPlan { request, plan } if *request == req && plan.steps.len() == 3));
+}
+
+#[test]
+fn flow_finish_blocked_emits_failed_and_plan() {
+    let (t, _) = feature_repo();
+    let h = Harness::new();
+    h.open(t.path());
+    t.write("a.txt", b"edited\n");
+    let req = common::feature_req("feature/x");
+    let m = h.mark();
+    h.ctl.send(Command::FlowFinish(req.clone()));
+    let (i, _) = h.wait_for(m, |e| matches!(e, Event::FlowFailed(t) if t.starts_with("1 uncommitted change")));
+    h.wait_for(i, |e| {
+        matches!(e, Event::FlowPlan { request, plan } if *request == req && plan.blocker == Some(Blocker::Dirty(1)))
+    });
+    assert!(t.has_branch("feature/x"));
+}
+
+#[test]
+fn flow_finish_release_pushes_to_origin() {
+    let (t, cfg, bare) = release_repo();
+    let h = Harness::new();
+    let m = h.open(t.path());
+    h.ctl.send(Command::FlowFinish(push_release_req()));
+    let (i, _) = h.wait_within(PUSH_TIMEOUT, m, |e| matches!(e, Event::FlowPushing));
+    h.wait_within(PUSH_TIMEOUT, i, |e| matches!(e, Event::FlowDone(n) if n.ends_with("and the tag to origin.")));
+    assert!(origin_ref(&bare, "refs/tags/1.2.0").is_some());
+    assert_eq!(origin_ref(&bare, &format!("refs/heads/{}", cfg.production)), Some(t.tip(&cfg.production)));
+    h.wait_for(m, |e| matches!(e, Event::Flow(s) if s.push_default));
+}
+
+#[test]
+fn flow_push_failure_then_retry() {
+    let (t, cfg, bare) = release_repo();
+    let old = advance_origin_production(&bare, &cfg);
+    let h = Harness::new();
+    finish_with_rejected_push(&h, &t);
+    assert!(origin_ref(&bare, "refs/tags/1.2.0").is_none());
+
+    let prod_ref = format!("refs/heads/{}", cfg.production);
+    git(bare.path(), &["update-ref", &prod_ref, &old.to_string()]);
+    let m2 = h.mark();
+    h.ctl.send(Command::FlowRetryPush);
+    let (i, _) = h.wait_within(PUSH_TIMEOUT, m2, |e| matches!(e, Event::FlowPushing));
+    h.wait_within(PUSH_TIMEOUT, i, |e| matches!(e, Event::FlowDone(n) if n.ends_with("and the tag to origin.")));
+    assert!(origin_ref(&bare, "refs/tags/1.2.0").is_some());
+}
+
+#[test]
+fn flow_drop_push_reports_not_pushed() {
+    let (t, cfg, bare) = release_repo();
+    advance_origin_production(&bare, &cfg);
+    let h = Harness::new();
+    finish_with_rejected_push(&h, &t);
+    let m2 = h.mark();
+    h.ctl.send(Command::FlowDropPush);
+    h.wait_for(m2, |e| matches!(e, Event::FlowDone(n) if n == "Finished release/1.2.0. Tagged 1.2.0. Not pushed."));
+    assert!(origin_ref(&bare, "refs/tags/1.2.0").is_none());
+
+    // The pending push is gone: a retry does nothing.
+    let m3 = h.mark();
+    h.ctl.send(Command::FlowRetryPush);
+    h.ctl.send(Command::ListBranches);
+    h.wait_for(m3, |e| matches!(e, Event::Branches(_)));
+    assert!(!h.events.lock().unwrap()[m3..].iter().any(|e| matches!(e, Event::FlowPushing)));
+}
+
+#[test]
+fn branch_created_outside_updates_flow_state() {
+    let (t, _) = common::flow_repo();
+    let h = Harness::new();
+    let m = h.open(t.path());
+    t.branch("feature/outside");
+    h.wait_for(m, |e| matches!(e, Event::Flow(s) if s.features.contains(&"feature/outside".to_string())));
 }
