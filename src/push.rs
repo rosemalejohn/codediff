@@ -24,8 +24,12 @@ pub fn find_git() -> Option<PathBuf> {
 
 /// Arguments after `git`. Atomic, never forced: the only lease flag guards the
 /// remote branch delete. Branches are pushed as the commits the finish made.
+/// User config (`push.followTags`, `push.recurseSubmodules`) adds nothing.
 pub fn push_args(spec: &PushSpec) -> Vec<String> {
-    let mut args: Vec<String> = vec!["push".into(), "--atomic".into(), "--porcelain".into()];
+    let mut args: Vec<String> = ["push", "--atomic", "--porcelain", "--no-follow-tags", "--recurse-submodules=no"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     if let Some((branch, oid)) = &spec.delete {
         args.push(format!("--force-with-lease=refs/heads/{branch}:{oid}"));
     }
@@ -48,6 +52,8 @@ pub fn push(git: &Path, workdir: &Path, spec: &PushSpec) -> std::result::Result<
         .args(["-c", "advice.pushUpdateRejected=false"])
         .args(push_args(spec))
         .env("GIT_TERMINAL_PROMPT", "0")
+        // `failure_reason` matches Git's English output.
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

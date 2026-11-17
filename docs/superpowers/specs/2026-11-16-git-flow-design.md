@@ -226,6 +226,7 @@ Step 3 is a handful of reference writes. If one of them fails, the error banner 
 - **All or nothing on origin** (Claude's call): the push is atomic (`git push --atomic`). Either every reference above is updated or none is, so origin never ends up with the tag but not the production branch. If origin does not support atomic pushes, the push fails with that reason and nothing is sent. GitHub supports it.
 - **Guarded remote delete** (Claude's call): the delete only happens if origin's branch is still exactly the commit that was merged (a lease on that one reference, `--force-with-lease=<branch>:<merged commit>`). If someone pushed more commits to it, the whole push is refused and nothing is sent. The lease only restricts the delete; it forces nothing.
 - Never overwrites or discards commits on origin: no forced update of any branch or tag.
+- Exactly the references above: the user's Git config cannot widen the push (`--no-follow-tags`, `--recurse-submodules=no`).
 - Must never wait for input: terminal prompts are disabled, and a push that cannot authenticate fails with Git's message. It must not hang forever.
 - Failure: the local finish stays done and nothing was sent. The dialog shows Git's reason and Close / Retry Push. Retry runs the same push again. Close leaves the "Not pushed" notice.
 - The UI stays responsive while pushing; the dialog shows progress.

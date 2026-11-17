@@ -46,6 +46,8 @@ fn push_args_shape() {
             "push",
             "--atomic",
             "--porcelain",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
             &format!("--force-with-lease=refs/heads/release/1.2.0:{oid}"),
             "origin",
             &format!("{main}:refs/heads/main"),
@@ -61,6 +63,8 @@ fn push_args_shape() {
             "push",
             "--atomic",
             "--porcelain",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
             "origin",
             &format!("{main}:refs/heads/main"),
             &format!("{develop}:refs/heads/develop"),
@@ -176,4 +180,20 @@ fn push_sends_the_finished_commits_not_later_ones() {
     push(&git_bin(), t.path(), &spec).unwrap();
     assert_eq!(origin_ref(&bare, "refs/heads/develop"), Some(finished_develop));
     assert_eq!(origin_ref(&bare, &format!("refs/heads/{}", cfg.production)), Some(t.tip(&cfg.production)));
+}
+
+/// `push.followTags` in the user's config must not add other tags to the push.
+#[test]
+fn push_ignores_follow_tags_config() {
+    let (t, cfg, bare) = with_origin();
+    release_on_origin(&t, &cfg);
+    t.repo.config().unwrap().set_bool("push.followTags", true).unwrap();
+    let head = t.repo.head().unwrap().peel_to_commit().unwrap();
+    let sig = t.repo.signature().unwrap();
+    t.repo.tag("unrelated", head.as_object(), &sig, "not part of the finish", false).unwrap();
+
+    let spec = spec_for(&t, &cfg);
+    push(&git_bin(), t.path(), &spec).unwrap();
+    assert!(origin_ref(&bare, "refs/tags/1.2.0").is_some());
+    assert_eq!(origin_ref(&bare, "refs/tags/unrelated"), None);
 }
