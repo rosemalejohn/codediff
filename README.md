@@ -39,6 +39,22 @@ Use the System / Light / Dark switch at the right end of the top bar. System fol
 | u | Unstage the selected file (Changes tab) |
 | Cmd+Backspace | Open the discard confirmation dialog for the selected file (Changes tab; never discards directly) |
 | Esc / Return | Cancel the open confirmation dialog |
+| Option+Cmd+F | Open Git Flow Next Action: search the Git Flow actions that fit the current branch |
+| Return / Esc (in a Git Flow dialog) | Return runs the main button, Esc cancels |
+
+## Git Flow
+
+The Git Flow button in the top bar, right of the branch button, works like the one in Sourcetree. It starts and finishes feature, release and hotfix branches, and it reads and writes the same `gitflow.*` keys in `.git/config` as Sourcetree and the git-flow command line, so a repository set up by either shows up as initialized.
+
+- Initialize Repository picks the production branch, creates the development branch if it does not exist, and sets the branch prefixes and the version tag prefix.
+- Start New Feature, Release or Hotfix branches from `develop` (from production for a hotfix) and switches to the new branch. Uncommitted changes come along.
+- Finish lists every step before it runs. A release or hotfix is merged into production, tagged, merged back into `develop`, and optionally deleted. The tag and the tag message are editable. Finish Feature never tags and never pushes.
+- Finish needs a clean working tree. It test-merges in memory first and refuses on a conflict: it lists the files and changes nothing. It never resolves conflicts. Merge `develop` into the branch yourself (agent or terminal), then finish again.
+- Push to origin is optional, off the first time, and then remembers your last choice per repository. It needs the `git` command line. The push is a single `git push --atomic` of production, `develop` and the tag, so either every reference moves or none does. It never forces. With Delete branch ticked as well, the remote branch is deleted in the same atomic push, guarded so it only happens if origin's branch is still at the commit the app last saw.
+- If the push fails, the finish stays done locally. The dialog says why and offers Retry Push, or Close to push later yourself.
+- The app never fetches or pulls. Checks such as "behind origin" use the state of origin as of the last fetch, so fetch (or pull) in a terminal first when other people push to the same branches.
+
+The end-to-end walk through the UI bridge against a scratch repository and a local bare `origin` is covered by `tests/flow_e2e_test.rs`. Walking it in a real window is a manual step that has not been done. Capture any Git Flow screen with `cargo run --example screenshot -- . out.bmp <0|1|2> flow-menu` (modes are listed in the header of `examples/screenshot.rs`).
 
 ## Performance
 
