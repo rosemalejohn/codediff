@@ -549,7 +549,7 @@ fn finish_with_push_returns_spec() {
     assert_eq!(
         out.push,
         Some(PushSpec {
-            branches: vec![cfg.production.clone(), "develop".into()],
+            branches: vec![(cfg.production.clone(), t.tip(&cfg.production)), ("develop".into(), t.tip("develop"))],
             tag: "1.2.0".into(),
             delete: Some(("release/1.2.0".into(), release_tip)),
         })

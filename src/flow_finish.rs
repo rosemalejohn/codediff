@@ -103,8 +103,9 @@ pub struct FinishPlan {
 /// What a release or hotfix finish hands to the push.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushSpec {
-    /// Production, then develop.
-    pub branches: Vec<String>,
+    /// Production, then develop, each with the commit this finish produced
+    /// for it. That commit is pushed, not whatever the branch holds later.
+    pub branches: Vec<(String, Oid)>,
     pub tag: String,
     /// Remote branch to delete and the commit origin must still have for it:
     /// the target of `refs/remotes/origin/{branch}` when the finish ran (the
@@ -561,7 +562,10 @@ pub fn finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Resul
         return Ok(FinishOutcome { notice, pushed_notice: String::new(), push: None });
     }
     let push = req.push.then(|| PushSpec {
-        branches: vec![cfg.production.clone(), develop.clone()],
+        branches: [production.map(|p| (cfg.production.clone(), p)), Some((develop.clone(), new_develop))]
+            .into_iter()
+            .flatten()
+            .collect(),
         tag: req.tag.clone(),
         delete: origin_tip.map(|id| (b.clone(), id)),
     });

@@ -23,15 +23,15 @@ pub fn find_git() -> Option<PathBuf> {
 }
 
 /// Arguments after `git`. Atomic, never forced: the only lease flag guards the
-/// remote branch delete.
+/// remote branch delete. Branches are pushed as the commits the finish made.
 pub fn push_args(spec: &PushSpec) -> Vec<String> {
     let mut args: Vec<String> = vec!["push".into(), "--atomic".into(), "--porcelain".into()];
     if let Some((branch, oid)) = &spec.delete {
         args.push(format!("--force-with-lease=refs/heads/{branch}:{oid}"));
     }
     args.push("origin".into());
-    for b in &spec.branches {
-        args.push(format!("refs/heads/{b}"));
+    for (b, oid) in &spec.branches {
+        args.push(format!("{oid}:refs/heads/{b}"));
     }
     args.push(format!("refs/tags/{}", spec.tag));
     if let Some((branch, _)) = &spec.delete {

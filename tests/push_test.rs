@@ -33,8 +33,10 @@ fn clone_of(bare: &tempfile::TempDir) -> tempfile::TempDir {
 #[test]
 fn push_args_shape() {
     let oid = Oid::from_str("0123456789012345678901234567890123456789").unwrap();
+    let main = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+    let develop = Oid::from_str("2222222222222222222222222222222222222222").unwrap();
     let mut spec = PushSpec {
-        branches: vec!["main".into(), "develop".into()],
+        branches: vec![("main".into(), main), ("develop".into(), develop)],
         tag: "1.2.0".into(),
         delete: Some(("release/1.2.0".into(), oid)),
     };
@@ -46,8 +48,8 @@ fn push_args_shape() {
             "--porcelain",
             &format!("--force-with-lease=refs/heads/release/1.2.0:{oid}"),
             "origin",
-            "refs/heads/main",
-            "refs/heads/develop",
+            &format!("{main}:refs/heads/main"),
+            &format!("{develop}:refs/heads/develop"),
             "refs/tags/1.2.0",
             ":refs/heads/release/1.2.0"
         ]
@@ -55,7 +57,15 @@ fn push_args_shape() {
     spec.delete = None;
     assert_eq!(
         push_args(&spec),
-        ["push", "--atomic", "--porcelain", "origin", "refs/heads/main", "refs/heads/develop", "refs/tags/1.2.0"]
+        [
+            "push",
+            "--atomic",
+            "--porcelain",
+            "origin",
+            &format!("{main}:refs/heads/main"),
+            &format!("{develop}:refs/heads/develop"),
+            "refs/tags/1.2.0"
+        ]
     );
 }
 
@@ -142,7 +152,28 @@ fn delete_refused_when_origin_branch_moved() {
 #[test]
 fn push_without_origin_fails() {
     let (t, cfg) = flow_repo();
-    let spec = PushSpec { branches: vec![cfg.production.clone(), "develop".into()], tag: "1.2.0".into(), delete: None };
+    let spec = PushSpec {
+        branches: vec![(cfg.production.clone(), t.tip(&cfg.production)), ("develop".into(), t.tip("develop"))],
+        tag: "1.2.0".into(),
+        delete: None,
+    };
     let err = push(&git_bin(), t.path(), &spec).unwrap_err();
     assert!(!err.is_empty() && !err.contains("hint:"), "{err}");
+}
+
+/// The push sends the commits the finish produced: a commit the agent adds to
+/// develop afterwards (the working tree is on develop) stays local.
+#[test]
+fn push_sends_the_finished_commits_not_later_ones() {
+    let (t, cfg, bare) = with_origin();
+    release_on_origin(&t, &cfg);
+    let spec = spec_for(&t, &cfg);
+    let finished_develop = t.tip("develop");
+    assert_eq!(t.head_branch(), "develop");
+    let later = t.commit_file("later.txt", b"later\n", "agent commit after the finish");
+    assert_ne!(later, finished_develop);
+
+    push(&git_bin(), t.path(), &spec).unwrap();
+    assert_eq!(origin_ref(&bare, "refs/heads/develop"), Some(finished_develop));
+    assert_eq!(origin_ref(&bare, &format!("refs/heads/{}", cfg.production)), Some(t.tip(&cfg.production)));
 }
