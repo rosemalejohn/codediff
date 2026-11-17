@@ -365,10 +365,11 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
 }
 
 /// The newest tag with the version tag prefix whose commit is the production
-/// tip or one of its ancestors.
+/// tip or one of its ancestors. Candidates are tried newest first (ties: the
+/// higher version), so the graph is walked only until the first reachable one.
 pub fn latest_tag(repo: &Repository, cfg: &FlowConfig) -> Result<Option<TagInfo>> {
     let tip = repo.find_branch(&cfg.production, BranchType::Local)?.get().peel_to_commit()?.id();
-    let mut best: Option<TagInfo> = None;
+    let mut candidates: Vec<(TagInfo, git2::Oid)> = Vec::new();
     for name in repo.tag_names(None)?.iter().flatten().flatten() {
         if !name.starts_with(&cfg.version_tag) {
             continue;
@@ -376,19 +377,16 @@ pub fn latest_tag(repo: &Repository, cfg: &FlowConfig) -> Result<Option<TagInfo>
         let Ok(commit) = repo.find_reference(&format!("refs/tags/{name}")).and_then(|r| r.peel_to_commit()) else {
             continue;
         };
-        if commit.id() != tip && !repo.graph_descendant_of(tip, commit.id())? {
-            continue;
-        }
-        let time = commit.time().seconds();
-        let better = match &best {
-            None => true,
-            Some(b) => time.cmp(&b.time).then_with(|| compare_versions(name, &b.name)) == Ordering::Greater,
-        };
-        if better {
-            best = Some(TagInfo { name: name.to_string(), time });
+        candidates.push((TagInfo { name: name.to_string(), time: commit.time().seconds() }, commit.id()));
+    }
+    // Stable, so exact ties keep the name order of `tag_names`, as before.
+    candidates.sort_by(|(a, _), (b, _)| b.time.cmp(&a.time).then_with(|| compare_versions(&b.name, &a.name)));
+    for (info, id) in candidates {
+        if id == tip || repo.graph_descendant_of(tip, id)? {
+            return Ok(Some(info));
         }
     }
-    Ok(best)
+    Ok(None)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

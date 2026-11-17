@@ -421,3 +421,41 @@ fn next_actions_current_release_and_open_hotfix() {
     assert_eq!(rows[1].name, "Finish hotfix 1.0.1");
     assert_eq!(rows[1].detail, "Merge into main and develop, tag");
 }
+
+#[test]
+fn latest_tag_reads_annotated_tags() {
+    let (t, cfg) = timed_flow_repo("");
+    let sig = t.repo.signature().unwrap();
+    let c1 = t.repo.revparse_single("HEAD~1").unwrap();
+    let c2 = t.repo.revparse_single("HEAD").unwrap();
+    t.repo.tag("1.0.0", &c1, &sig, "Release 1.0.0", false).unwrap();
+    t.repo.tag("1.1.0", &c2, &sig, "Release 1.1.0", false).unwrap();
+    init(&t.repo, &cfg).unwrap();
+    // An annotated tag on a newer commit that production does not contain.
+    t.write("b.txt", b"x\n");
+    t.stage("b.txt");
+    let unreachable = t.commit_at("develop only", 3000);
+    t.repo.tag("9.9.9", &t.repo.find_object(unreachable, None).unwrap(), &sig, "not released", false).unwrap();
+    assert_eq!(latest_tag(&t.repo, &cfg).unwrap(), Some(TagInfo { name: "1.1.0".into(), time: 2000 }));
+}
+
+/// Many tags, many reachable: the lookup stops at the newest reachable one
+/// instead of walking the graph once per tag.
+#[test]
+fn latest_tag_with_many_tags_is_fast() {
+    let t = TestRepo::new();
+    for i in 0..400i64 {
+        t.write("a.txt", format!("{i}\n").as_bytes());
+        t.stage("a.txt");
+        let id = t.commit_at(&format!("c{i}"), 1000 + i);
+        let obj = t.repo.find_object(id, None).unwrap();
+        t.repo.tag_lightweight(&format!("1.0.{i}"), &obj, false).unwrap();
+    }
+    let cfg = default_config(&t.head_branch());
+    init(&t.repo, &cfg).unwrap();
+    let started = std::time::Instant::now();
+    let found = latest_tag(&t.repo, &cfg).unwrap().unwrap();
+    let took = started.elapsed();
+    assert_eq!(found.name, "1.0.399");
+    assert!(took < std::time::Duration::from_millis(500), "latest_tag took {took:?}");
+}
