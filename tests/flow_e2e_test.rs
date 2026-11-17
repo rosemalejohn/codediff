@@ -113,6 +113,18 @@ fn git_flow_end_to_end_through_the_ui_bridge() {
     t.commit_file("demo.txt", b"demo\n", "add demo");
     let plan = open_finish(&app, &rx, "finish:feature:feature/demo");
     assert!(plan.iter().all(|(_, remote)| !remote), "a feature finish has no remote step: {plan:?}");
+
+    // The agent commits while the dialog is open: Finish is pinned to the tips
+    // the owner saw, so it refuses and the fresh plan comes back.
+    let late = t.commit_file("late.txt", b"late\n", "late commit");
+    f.invoke_submit_finish();
+    wait_for(&app, &rx, "finish refused because the branch moved", |a| {
+        let f = a.global::<Flow>();
+        f.get_error() == "feature/demo changed since you looked. Review the new commits, then finish again."
+            && f.get_blocker_level() == 0
+    });
+    assert_eq!(f.get_dialog(), 3, "dialog stays open");
+    assert!(t.has_branch("feature/demo"), "nothing was finished");
     f.invoke_submit_finish();
     wait_for(&app, &rx, "feature finished", |a| {
         a.global::<Flow>().get_dialog() == 0 && a.get_branch_name() == "develop"
@@ -122,6 +134,7 @@ fn git_flow_end_to_end_through_the_ui_bridge() {
         "Finished feature/demo. Merged into develop and deleted the branch."
     );
     assert!(!t.has_branch("feature/demo"));
+    assert!(t.repo.graph_descendant_of(t.tip("develop"), late).unwrap() || t.tip("develop") == late);
 
     // Start a release and finish it with a push and the branch deleted.
     start(&app, &rx, "release", "0.1.0", "release/0.1.0");

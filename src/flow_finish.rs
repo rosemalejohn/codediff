@@ -23,10 +23,15 @@ pub struct FinishRequest {
     pub delete_branch: bool,
     /// Ignored for a feature.
     pub push: bool,
+    /// The branch tips the owner saw, from `FinishPlan::tips`. A finish
+    /// refuses when any of them has changed. Empty means not pinned (plans).
+    pub tips: Vec<(String, Oid)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocker {
+    /// A tip the finish was pinned to has changed since the plan.
+    Moved { branch: String },
     /// Number of changed tracked files.
     Dirty(usize),
     Busy,
@@ -42,6 +47,7 @@ pub enum Blocker {
 impl Blocker {
     pub fn title(&self) -> String {
         match self {
+            Blocker::Moved { branch } => format!("{branch} changed since you looked"),
             Blocker::Dirty(1) => "1 uncommitted change".into(),
             Blocker::Dirty(n) => format!("{n} uncommitted changes"),
             Blocker::Busy => "Repository is busy".into(),
@@ -57,6 +63,7 @@ impl Blocker {
 
     pub fn body(&self) -> String {
         match self {
+            Blocker::Moved { .. } => "Review the new commits, then finish again.".into(),
             Blocker::Dirty(_) => {
                 "Finish needs a clean working tree. Commit them, or discard them in Changes, then try again.".into()
             }
@@ -88,6 +95,9 @@ pub struct Step {
 pub struct FinishPlan {
     pub steps: Vec<Step>,
     pub blocker: Option<Blocker>,
+    /// The tips this plan was computed from, as full branch names: the
+    /// finished branch, develop, and production for a release or hotfix.
+    pub tips: Vec<(String, Oid)>,
 }
 
 /// What a release or hotfix finish hands to the push.
@@ -167,17 +177,45 @@ fn tip(repo: &Repository, branch: &str) -> Result<Oid> {
     Ok(repo.find_branch(branch, BranchType::Local)?.get().peel_to_commit()?.id())
 }
 
-/// Runs every merge of the finish in memory. Needs a Git identity for the
-/// production merge commit of a release or hotfix.
-pub(crate) fn simulate(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Result<Simulation> {
-    let branch_tip = tip(repo, &req.branch)?;
-    let develop_tip = tip(repo, &cfg.develop)?;
+/// The branch tips one plan or finish works from, each read once.
+pub(crate) struct Tips {
+    pub branch: Oid,
+    pub develop: Oid,
+    /// None for a feature.
+    pub production: Option<Oid>,
+}
+
+impl Tips {
+    pub(crate) fn read(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Result<Tips> {
+        let production = match req.kind {
+            FlowKind::Feature => None,
+            FlowKind::Release | FlowKind::Hotfix => Some(tip(repo, &cfg.production)?),
+        };
+        Ok(Tips { branch: tip(repo, &req.branch)?, develop: tip(repo, &cfg.develop)?, production })
+    }
+
+    /// Full branch name and tip: the finished branch, develop, production.
+    fn named(&self, cfg: &FlowConfig, req: &FinishRequest) -> Vec<(String, Oid)> {
+        let mut out = vec![(req.branch.clone(), self.branch), (cfg.develop.clone(), self.develop)];
+        out.extend(self.production.map(|p| (cfg.production.clone(), p)));
+        out
+    }
+
+    fn of(&self, cfg: &FlowConfig, req: &FinishRequest, branch: &str) -> Option<Oid> {
+        self.named(cfg, req).into_iter().find(|(b, _)| b == branch).map(|(_, id)| id)
+    }
+}
+
+/// Runs every merge of the finish in memory from `tips`. Needs a Git identity
+/// for the production merge commit of a release or hotfix.
+pub(crate) fn simulate(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest, tips: &Tips) -> Result<Simulation> {
+    let branch_tip = tips.branch;
+    let develop_tip = tips.develop;
     let tree_of = |id: Oid| -> Result<Oid> { Ok(repo.find_commit(id)?.tree_id()) };
 
-    let (production, into_develop) = match req.kind {
-        FlowKind::Feature => (None, branch_tip),
-        FlowKind::Release | FlowKind::Hotfix => {
-            let production_tip = tip(repo, &cfg.production)?;
+    let (production, into_develop) = match (req.kind, tips.production) {
+        (FlowKind::Feature, _) | (_, None) => (None, branch_tip),
+        (FlowKind::Release | FlowKind::Hotfix, Some(production_tip)) => {
             let new_tip = match test_merge(repo, production_tip, branch_tip)? {
                 Merge::AlreadyMerged => production_tip,
                 Merge::Conflict(files) => {
@@ -206,13 +244,13 @@ fn step(text: String, note: String, remote: bool) -> Step {
     Step { text, note, remote }
 }
 
-fn steps(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Result<Vec<Step>> {
+fn steps(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest, tips: &Tips) -> Result<Vec<Step>> {
     let b = &req.branch;
-    let first_target = match req.kind {
-        FlowKind::Feature => &cfg.develop,
-        FlowKind::Release | FlowKind::Hotfix => &cfg.production,
+    let (first_target, target_tip) = match (req.kind, tips.production) {
+        (FlowKind::Release | FlowKind::Hotfix, Some(p)) => (&cfg.production, p),
+        _ => (&cfg.develop, tips.develop),
     };
-    let (ahead, _) = repo.graph_ahead_behind(tip(repo, b)?, tip(repo, first_target)?)?;
+    let (ahead, _) = repo.graph_ahead_behind(tips.branch, target_tip)?;
     let note = match ahead {
         0 => "already merged".to_string(),
         1 => "1 commit".to_string(),
@@ -283,11 +321,11 @@ fn other_worktrees(repo: &Repository) -> Result<Vec<(String, PathBuf)>> {
         .collect())
 }
 
-fn behind_origin(repo: &Repository, branch: &str) -> Result<bool> {
+fn behind_origin(repo: &Repository, branch: &str, local_tip: Oid) -> Result<bool> {
     let Ok(remote) = repo.find_reference(&format!("refs/remotes/origin/{branch}")) else {
         return Ok(false);
     };
-    let (_, behind) = repo.graph_ahead_behind(tip(repo, branch)?, remote.peel_to_commit()?.id())?;
+    let (_, behind) = repo.graph_ahead_behind(local_tip, remote.peel_to_commit()?.id())?;
     Ok(behind > 0)
 }
 
@@ -322,7 +360,7 @@ fn collisions(repo: &Repository, tree: Oid) -> Result<Vec<String>> {
     Ok(found.into_iter().collect())
 }
 
-fn find_blocker(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Result<Option<Blocker>> {
+fn find_blocker(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest, tips: &Tips) -> Result<Option<Blocker>> {
     let dirty = dirty_count(repo)?;
     if dirty > 0 {
         return Ok(Some(Blocker::Dirty(dirty)));
@@ -347,7 +385,11 @@ fn find_blocker(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Res
         }
     }
     for branch in touched.iter().copied().chain([req.branch.as_str()]) {
-        if behind_origin(repo, branch)? {
+        let local_tip = match tips.of(cfg, req, branch) {
+            Some(id) => id,
+            None => tip(repo, branch)?,
+        };
+        if behind_origin(repo, branch, local_tip)? {
             return Ok(Some(Blocker::BehindOrigin { branch: branch.into() }));
         }
     }
@@ -361,7 +403,7 @@ fn find_blocker(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Res
         }
     }
 
-    match simulate(repo, cfg, req)? {
+    match simulate(repo, cfg, req, tips)? {
         Simulation::Conflict { target, files } => {
             Ok(Some(Blocker::Conflict { target, branch: req.branch.clone(), files }))
         }
@@ -372,10 +414,28 @@ fn find_blocker(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Res
     }
 }
 
-/// The steps a finish would run and the first thing that blocks it.
-/// Changes no reference, HEAD, index or working tree.
+/// The steps a finish would run, the first thing that blocks it, and the
+/// tips it was computed from. Changes no reference, HEAD, index or working
+/// tree. Never reports `Blocker::Moved`: `req.tips` is ignored here.
 pub fn plan_finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Result<FinishPlan> {
-    Ok(FinishPlan { steps: steps(repo, cfg, req)?, blocker: find_blocker(repo, cfg, req)? })
+    let tips = Tips::read(repo, cfg, req)?;
+    Ok(FinishPlan {
+        steps: steps(repo, cfg, req, &tips)?,
+        blocker: find_blocker(repo, cfg, req, &tips)?,
+        tips: tips.named(cfg, req),
+    })
+}
+
+/// The first pinned tip that differs from `tips`, None when the request is
+/// not pinned or nothing moved.
+fn moved(cfg: &FlowConfig, req: &FinishRequest, tips: &Tips) -> Option<Blocker> {
+    if req.tips.is_empty() {
+        return None;
+    }
+    tips.named(cfg, req)
+        .into_iter()
+        .find(|(branch, id)| !req.tips.iter().any(|(b, pinned)| b == branch && pinned == id))
+        .map(|(branch, _)| Blocker::Moved { branch })
 }
 
 fn blocked(b: &Blocker) -> CoreError {
@@ -393,19 +453,24 @@ fn move_branch(repo: &Repository, branch: &str, from: Oid, to: Oid) -> Result<()
 /// One reference change of a finish, labelled with its plan step text.
 type Move<'a> = (String, Box<dyn FnOnce() -> Result<()> + 'a>);
 
-/// Runs the finish. In order: plan and refuse on a blocker; write every new
-/// commit unreferenced; check out develop's new tip while HEAD still points
-/// at the old commit; then move the references. Until that last stage an
-/// error leaves every reference, HEAD and the working tree as they were.
+/// Runs the finish. In order: read the tips once and refuse when a pinned
+/// one moved or a blocker stands; write every new commit unreferenced; check
+/// out develop's new tip while HEAD still points at the old commit; then move
+/// the references. Until that last stage an error leaves every reference,
+/// HEAD and the working tree as they were.
 pub fn finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Result<FinishOutcome> {
-    if let Some(b) = plan_finish(repo, cfg, req)?.blocker {
+    let tips = Tips::read(repo, cfg, req)?;
+    if let Some(b) = moved(cfg, req, &tips) {
+        return Err(blocked(&b));
+    }
+    if let Some(b) = find_blocker(repo, cfg, req, &tips)? {
         return Err(blocked(&b));
     }
     let b = &req.branch;
     let feature = req.kind == FlowKind::Feature;
-    let branch_tip = tip(repo, b)?;
-    let develop_tip = tip(repo, &cfg.develop)?;
-    let production_tip = if feature { None } else { Some(tip(repo, &cfg.production)?) };
+    let branch_tip = tips.branch;
+    let develop_tip = tips.develop;
+    let production_tip = tips.production;
     // Read before any reference moves.
     let origin_tip = match repo.find_reference(&format!("refs/remotes/origin/{b}")) {
         Ok(r) if !feature && req.push && req.delete_branch => Some(r.peel_to_commit()?.id()),
@@ -413,7 +478,7 @@ pub fn finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Resul
     };
 
     // New commits, referenced by nothing yet.
-    let (production, develop_tree) = match simulate(repo, cfg, req)? {
+    let (production, develop_tree) = match simulate(repo, cfg, req, &tips)? {
         Simulation::Clean { production, develop_tree } => (production, develop_tree),
         Simulation::Conflict { target, files } => {
             return Err(blocked(&Blocker::Conflict { target, branch: b.clone(), files }));
@@ -462,7 +527,15 @@ pub fn finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Resul
     let switch = move || Ok(repo.set_head(&format!("refs/heads/{develop}"))?);
     moves.push((format!("Switch to {develop}"), Box::new(switch)));
     if req.delete_branch {
-        let delete = move || Ok(repo.find_branch(b, BranchType::Local)?.delete()?);
+        // Only while it still holds the commit this finish merged: a commit
+        // that landed on it meanwhile must not go with it.
+        let delete = move || {
+            let mut branch = repo.find_branch(b, BranchType::Local)?;
+            if branch.get().peel_to_commit()?.id() != branch_tip {
+                return Err(CoreError::Flow(Blocker::Moved { branch: b.clone() }.title()));
+            }
+            Ok(branch.delete()?)
+        };
         moves.push((format!("Delete {b}"), Box::new(delete)));
     }
 
@@ -470,7 +543,11 @@ pub fn finish(repo: &Repository, cfg: &FlowConfig, req: &FinishRequest) -> Resul
     for (text, run) in moves {
         if let Err(cause) = run() {
             let done = if done.is_empty() { "nothing".to_string() } else { done.join(", ") };
-            return Err(CoreError::Flow(format!("Finish stopped at: {text}. Already done: {done}. Cause: {cause}")));
+            // Every move runs after the checkout.
+            return Err(CoreError::Flow(format!(
+                "Finish stopped at: {text}. Already done: {done}. \
+                 The working tree already shows {develop}'s new content. Cause: {cause}"
+            )));
         }
         done.push(text);
     }

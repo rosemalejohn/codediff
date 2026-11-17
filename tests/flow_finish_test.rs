@@ -651,7 +651,11 @@ fn finish_names_the_step_that_stopped() {
 
     let Err(CoreError::Flow(m)) = err else { panic!("expected a Flow error, got {err:?}") };
     let (head, cause) = m.split_once(" Cause: ").expect("message names the cause");
-    assert_eq!(head, "Finish stopped at: Delete feature/x. Already done: Merge feature/x into develop, Switch to develop.");
+    assert_eq!(
+        head,
+        "Finish stopped at: Delete feature/x. Already done: Merge feature/x into develop, Switch to develop. \
+         The working tree already shows develop's new content."
+    );
     assert!(!cause.trim().is_empty());
     assert_eq!(t.tip("develop"), feature_tip);
     assert_eq!(t.head_branch(), "develop");
@@ -673,4 +677,159 @@ fn finish_push_delete_leases_origin_tip() {
     let out = finish(&t.repo, &cfg, &req).unwrap();
     assert_eq!(out.push.unwrap().delete, Some(("release/1.2.0".to_string(), origin_tip)));
     assert!(!t.has_branch("release/1.2.0"));
+}
+
+/// `req` pinned to the tips of a plan computed for it now.
+fn pinned(t: &TestRepo, cfg: &FlowConfig, req: FinishRequest) -> FinishRequest {
+    let tips = plan_finish(&t.repo, cfg, &req).unwrap().tips;
+    FinishRequest { tips, ..req }
+}
+
+fn moved_message(branch: &str) -> String {
+    let b = Blocker::Moved { branch: branch.into() };
+    assert_eq!(b.title(), format!("{branch} changed since you looked"));
+    assert_eq!(b.body(), "Review the new commits, then finish again.");
+    format!("{}. {}", b.title(), b.body())
+}
+
+#[test]
+fn plan_carries_the_tips_it_was_computed_from() {
+    let (t, cfg) = release_repo();
+    let p = plan_finish(&t.repo, &cfg, &release_req("release/1.2.0", "1.2.0", "Release 1.2.0")).unwrap();
+    assert_eq!(
+        p.tips,
+        vec![
+            ("release/1.2.0".to_string(), t.tip("release/1.2.0")),
+            ("develop".to_string(), t.tip("develop")),
+            (cfg.production.clone(), t.tip(&cfg.production)),
+        ]
+    );
+    let (t, cfg) = on_branch("feature/x");
+    t.commit_file("feature-file.txt", b"feature\n", "one");
+    let p = plan_finish(&t.repo, &cfg, &feature_req("feature/x")).unwrap();
+    assert_eq!(p.tips, vec![("feature/x".to_string(), t.tip("feature/x")), ("develop".to_string(), t.tip("develop"))]);
+}
+
+#[test]
+fn finish_refuses_when_the_finished_branch_moved_and_changes_nothing() {
+    let (t, cfg) = on_branch("feature/x");
+    t.commit_file("feature-file.txt", b"feature\n", "one");
+    let req = pinned(&t, &cfg, feature_req("feature/x"));
+    // The agent commits after the owner looked.
+    t.commit_file("late.txt", b"late\n", "late commit");
+
+    let before = snapshot(&t);
+    let err = finish(&t.repo, &cfg, &req);
+    assert!(matches!(err, Err(CoreError::Flow(ref m)) if *m == moved_message("feature/x")), "{err:?}");
+    assert_eq!(snapshot(&t), before);
+    assert!(t.exists("late.txt"));
+}
+
+#[test]
+fn finish_refuses_when_develop_moved_and_changes_nothing() {
+    let (t, cfg) = release_repo();
+    let req = pinned(&t, &cfg, release_req("release/1.2.0", "1.2.0", "Release 1.2.0"));
+    let develop = t.tip("develop");
+    set_ref(&t.repo, "refs/heads/develop", loose_commit(&t.repo, develop, "agent on develop"));
+
+    let before = snapshot(&t);
+    let err = finish(&t.repo, &cfg, &req);
+    assert!(matches!(err, Err(CoreError::Flow(ref m)) if *m == moved_message("develop")), "{err:?}");
+    assert_eq!(snapshot(&t), before);
+    assert!(t.repo.find_reference("refs/tags/1.2.0").is_err());
+}
+
+#[test]
+fn moved_is_checked_before_dirty() {
+    let (t, cfg) = on_branch("feature/x");
+    t.commit_file("feature-file.txt", b"feature\n", "one");
+    let req = pinned(&t, &cfg, feature_req("feature/x"));
+    t.commit_file("late.txt", b"late\n", "late commit");
+    t.write("a.txt", b"dirty\n");
+    let err = finish(&t.repo, &cfg, &req);
+    assert!(matches!(err, Err(CoreError::Flow(ref m)) if *m == moved_message("feature/x")), "{err:?}");
+}
+
+#[test]
+fn pinned_finish_runs_when_nothing_moved_and_unpinned_ignores_moves() {
+    let (t, cfg) = on_branch("feature/x");
+    let feature_tip = t.commit_file("feature-file.txt", b"feature\n", "one");
+    let req = pinned(&t, &cfg, feature_req("feature/x"));
+    assert!(!req.tips.is_empty());
+    finish(&t.repo, &cfg, &req).unwrap();
+    assert_eq!(t.tip("develop"), feature_tip);
+
+    // Unpinned (empty tips): finishes whatever the tips are now.
+    let (t, cfg) = on_branch("feature/y");
+    t.commit_file("feature-file.txt", b"feature\n", "one");
+    let unpinned = feature_req("feature/y");
+    assert!(unpinned.tips.is_empty());
+    let late = t.commit_file("late.txt", b"late\n", "late commit");
+    finish(&t.repo, &cfg, &unpinned).unwrap();
+    assert!(t.repo.graph_descendant_of(t.tip("develop"), late).unwrap() || t.tip("develop") == late);
+}
+
+/// The finished branch is deleted only while it still points at the commit
+/// the finish merged. Here `hotfix/x` is a symbolic reference to develop, so
+/// the finish itself moves it when it moves develop: it must not be deleted.
+#[test]
+fn finish_keeps_a_finished_branch_that_moved_during_the_finish() {
+    let (t, cfg) = flow_repo();
+    t.commit_file("develop-file.txt", b"develop\n", "develop moves on");
+    t.repo.reference_symbolic("refs/heads/hotfix/x", "refs/heads/develop", false, "test").unwrap();
+    let old_develop = t.tip("develop");
+
+    let err = finish(&t.repo, &cfg, &hotfix_req("hotfix/x", "1.0.1", "Hotfix 1.0.1"));
+    let Err(CoreError::Flow(m)) = err else { panic!("expected a Flow error, got {err:?}") };
+    assert_eq!(
+        m,
+        format!(
+            "Finish stopped at: Delete hotfix/x. Already done: Merge hotfix/x into {p}, Tag {p} as 1.0.1, \
+             Merge hotfix/x back into develop, Switch to develop. \
+             The working tree already shows develop's new content. Cause: hotfix/x changed since you looked",
+            p = cfg.production
+        )
+    );
+    assert!(t.has_branch("hotfix/x"));
+    assert_ne!(t.tip("develop"), old_develop);
+}
+
+/// Production already contains the release: production stays, the tag goes on
+/// its tip, and develop merges production in.
+#[test]
+fn finish_release_production_already_contains() {
+    let (t, cfg) = flow_repo();
+    t.branch("release/1.0.1");
+    t.checkout(&cfg.production);
+    let prod_tip = t.commit_file("prod.txt", b"prod\n", "production moves on");
+    t.checkout("release/1.0.1");
+    let old_develop = t.tip("develop");
+    // The release branch sits on an ancestor of production.
+    assert!(t.repo.graph_descendant_of(prod_tip, t.tip("release/1.0.1")).unwrap());
+
+    let out = finish(&t.repo, &cfg, &release_req("release/1.0.1", "1.0.1", "Release 1.0.1")).unwrap();
+    assert_eq!(t.tip(&cfg.production), prod_tip);
+    let tag = t.repo.find_reference("refs/tags/1.0.1").unwrap().peel_to_tag().unwrap();
+    assert_eq!(tag.target_id(), prod_tip);
+    assert_eq!(parents(&t, t.tip("develop")), [old_develop, prod_tip]);
+    assert!(!t.has_branch("release/1.0.1"));
+    assert_eq!(t.head_branch(), "develop");
+    assert!(t.exists("prod.txt"));
+    assert_eq!(out.notice, "Finished release/1.0.1. Tagged 1.0.1. Not pushed.");
+}
+
+/// Develop already contains the new production tip: develop does not move.
+#[test]
+fn finish_release_develop_already_contains_production() {
+    let (t, cfg) = on_branch("release/1.0.1");
+    let tip = t.tip("develop");
+    assert_eq!(t.tip(&cfg.production), tip);
+
+    finish(&t.repo, &cfg, &release_req("release/1.0.1", "1.0.1", "Release 1.0.1")).unwrap();
+    assert_eq!(t.tip(&cfg.production), tip);
+    assert_eq!(t.tip("develop"), tip);
+    let tag = t.repo.find_reference("refs/tags/1.0.1").unwrap().peel_to_tag().unwrap();
+    assert_eq!(tag.target_id(), tip);
+    assert!(!t.has_branch("release/1.0.1"));
+    assert_eq!(t.head_branch(), "develop");
 }

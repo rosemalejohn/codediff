@@ -155,6 +155,7 @@ pub fn feature_req(branch: &str) -> FinishRequest {
         message: String::new(),
         delete_branch: true,
         push: false,
+        tips: Vec::new(),
     }
 }
 
@@ -167,6 +168,7 @@ pub fn release_req(branch: &str, tag: &str, message: &str) -> FinishRequest {
         message: message.into(),
         delete_branch: true,
         push: false,
+        tips: Vec::new(),
     }
 }
 

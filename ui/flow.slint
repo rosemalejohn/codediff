@@ -68,6 +68,8 @@ export global Flow {
     in-out property <string> blocker-title;
     in-out property <string> blocker-body;
     in-out property <[string]> blocker-files;
+    // Tips of the plan on screen, "<oid> <branch>"; Finish is pinned to them.
+    in-out property <[string]> plan-tips;
     in-out property <string> push-reason;
 
     // An action key: init, start:<kind>, finish:<kind>[:<branch>].

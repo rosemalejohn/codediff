@@ -754,6 +754,12 @@ fn apply_flow(window: &AppWindow, state: &FlowState, now: i64) {
     if window.get_switcher_open() && window.get_switcher_mode() == SWITCHER_FLOW {
         filter_flow_actions(window, &window.get_switcher_query());
     }
+    // The repository changed under an open Finish: plan again so the steps
+    // and counts follow it. Not while a plan or a submitted finish is
+    // pending; that answer is newer than this state.
+    if f.get_dialog() == FLOW_DIALOG_FINISH && f.get_blocker_level() != BLOCKER_PENDING {
+        f.invoke_plan_changed();
+    }
 }
 
 /// Puts every `Flow` property back to its default (another repository opened).
@@ -802,6 +808,7 @@ fn reset_flow(window: &AppWindow) {
     f.set_blocker_title(empty());
     f.set_blocker_body(empty());
     f.set_blocker_files(string_model(&[]));
+    f.set_plan_tips(string_model(&[]));
     f.set_push_reason(empty());
 }
 
@@ -907,7 +914,22 @@ fn finish_request(window: &AppWindow) -> FinishRequest {
         message: text(f.get_message()),
         delete_branch: f.get_delete_branch(),
         push: !feature && f.get_push() && f.get_push_blocked().is_empty(),
+        tips: Vec::new(),
     }
+}
+
+/// `finish_request` pinned to the tips of the plan on screen.
+fn pinned_finish_request(window: &AppWindow) -> FinishRequest {
+    let tips = window
+        .global::<Flow>()
+        .get_plan_tips()
+        .iter()
+        .filter_map(|t| {
+            let (id, branch) = t.split_once(' ')?;
+            Some((branch.to_string(), Oid::from_str(id).ok()?))
+        })
+        .collect();
+    FinishRequest { tips, ..finish_request(window) }
 }
 
 fn clear_finish_plan(window: &AppWindow) {
@@ -917,14 +939,20 @@ fn clear_finish_plan(window: &AppWindow) {
     f.set_blocker_title(SharedString::new());
     f.set_blocker_body(SharedString::new());
     f.set_blocker_files(string_model(&[]));
+    f.set_plan_tips(string_model(&[]));
 }
 
 /// Shows a plan, unless it answers a request that is no longer on screen.
+/// The request's tips do not count: a refused finish is answered with a plan
+/// for its pinned request.
 fn apply_finish_plan(window: &AppWindow, request: &FinishRequest, plan: FinishPlan) {
     let f = window.global::<Flow>();
-    if f.get_dialog() != FLOW_DIALOG_FINISH || *request != finish_request(window) {
+    let unpinned = FinishRequest { tips: Vec::new(), ..request.clone() };
+    if f.get_dialog() != FLOW_DIALOG_FINISH || unpinned != finish_request(window) {
         return;
     }
+    let tips: Vec<String> = plan.tips.iter().map(|(branch, id)| format!("{id} {branch}")).collect();
+    f.set_plan_tips(string_model(&tips));
     let steps: Vec<FlowStep> = plan
         .steps
         .into_iter()
@@ -1083,7 +1111,7 @@ fn wire_flow(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         if f.get_dialog() == FLOW_DIALOG_FINISH && f.get_blocker_level() == BLOCKER_NONE && f.get_steps().row_count() > 0
         {
             f.set_blocker_level(BLOCKER_PENDING);
-            s(Command::FlowFinish(finish_request(&w)));
+            s(Command::FlowFinish(pinned_finish_request(&w)));
         }
     });
 
@@ -3280,6 +3308,7 @@ mod tests {
             message: String::new(),
             delete_branch: true,
             push: false,
+            tips: Vec::new(),
         }
     }
 
@@ -3291,6 +3320,7 @@ mod tests {
             message: "Release 1.2.0".into(),
             delete_branch: true,
             push: true,
+            tips: Vec::new(),
         }
     }
 
@@ -3315,6 +3345,7 @@ mod tests {
                 step("Switch to develop", "", false),
             ],
             blocker,
+            tips: Vec::new(),
         }
     }
 
@@ -3436,6 +3467,7 @@ mod tests {
             plan: FinishPlan {
                 steps: vec![step("Merge feature/x into develop", "3 commits", false)],
                 blocker: Some(Blocker::Dirty(13)),
+                tips: Vec::new(),
             },
         });
         let first = f.get_steps().row_data(0).unwrap();
@@ -3551,9 +3583,66 @@ mod tests {
         let f = w.global::<Flow>();
         f.invoke_action("finish:release".into());
         let req = release_request();
-        apply(&w, Event::FlowPlan { request: req.clone(), plan: FinishPlan { steps: release_steps(), blocker: None } });
+        apply(&w, Event::FlowPlan { request: req.clone(), plan: FinishPlan { steps: release_steps(), blocker: None, tips: Vec::new() } });
         f.invoke_submit_finish();
         assert!(matches!(log.borrow().last(), Some(Command::FlowFinish(r)) if *r == req));
+    }
+
+    fn tips() -> Vec<(String, Oid)> {
+        vec![("feature/login-form".into(), oid("f1")), ("develop".into(), oid("d1"))]
+    }
+
+    #[test]
+    fn finish_is_pinned_to_the_plan_tips_and_plans_are_not() {
+        let (w, log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:feature".into());
+        assert!(matches!(log.borrow().last(), Some(Command::FlowPlan(r)) if r.tips.is_empty()));
+        let plan = FinishPlan { tips: tips(), ..feature_plan(None) };
+        apply(&w, Event::FlowPlan { request: feature_request("feature/login-form"), plan });
+        f.set_delete_branch(false);
+        f.invoke_plan_changed();
+        assert!(matches!(log.borrow().last(), Some(Command::FlowPlan(r)) if r.tips.is_empty()));
+        let mut req = feature_request("feature/login-form");
+        req.delete_branch = false;
+        apply(&w, Event::FlowPlan { request: req.clone(), plan: FinishPlan { tips: tips(), ..feature_plan(None) } });
+        f.invoke_submit_finish();
+        assert!(matches!(log.borrow().last(), Some(Command::FlowFinish(r)) if *r == FinishRequest { tips: tips(), ..req }));
+    }
+
+    #[test]
+    fn plan_answering_a_pinned_finish_is_shown() {
+        // The worker answers a refused (pinned) finish with a fresh plan for
+        // that request; the comparison with the dialog ignores the tips.
+        let (w, log) = finish_feature_window(None);
+        let f = w.global::<Flow>();
+        f.invoke_submit_finish();
+        apply(&w, Event::FlowFailed("feature/login-form changed since you looked. Review the new commits, then finish again.".into()));
+        let fresh = vec![("feature/login-form".into(), oid("f2")), ("develop".into(), oid("d1"))];
+        let pinned = FinishRequest { tips: tips(), ..feature_request("feature/login-form") };
+        apply(&w, Event::FlowPlan { request: pinned, plan: FinishPlan { tips: fresh.clone(), ..feature_plan(None) } });
+        assert_eq!(f.get_blocker_level(), 0);
+        f.invoke_submit_finish();
+        assert!(matches!(log.borrow().last(), Some(Command::FlowFinish(r)) if r.tips == fresh));
+    }
+
+    #[test]
+    fn flow_event_during_an_open_finish_requests_a_fresh_plan() {
+        let (w, log) = finish_feature_window(None);
+        let f = w.global::<Flow>();
+        apply(&w, Event::Flow(flow_state()));
+        assert!(matches!(log.borrow().as_slice(), [Command::FlowPlan(r)] if *r == feature_request("feature/login-form")));
+        // Finish waits for that plan.
+        assert_eq!(f.get_blocker_level(), -1);
+        f.invoke_submit_finish();
+        assert_eq!(log.borrow().len(), 1);
+        // Already waiting (for a plan or a submitted finish): no second request.
+        apply(&w, Event::Flow(flow_state()));
+        assert_eq!(log.borrow().len(), 1);
+        // No Finish dialog: nothing.
+        f.invoke_cancel();
+        apply(&w, Event::Flow(flow_state()));
+        assert_eq!(log.borrow().len(), 1);
     }
 
     #[test]
@@ -3646,7 +3735,7 @@ mod tests {
         let (w, log) = flow_window(release_state());
         let f = w.global::<Flow>();
         f.invoke_action("finish:release".into());
-        apply(&w, Event::FlowPlan { request: release_request(), plan: FinishPlan { steps: release_steps(), blocker: None } });
+        apply(&w, Event::FlowPlan { request: release_request(), plan: FinishPlan { steps: release_steps(), blocker: None, tips: Vec::new() } });
         apply(&w, Event::FlowPushing);
         assert_eq!(f.get_dialog(), 4);
         let states: Vec<i32> = f.get_steps().iter().map(|s| s.state).collect();
@@ -3683,7 +3772,7 @@ mod tests {
         let (w, log) = flow_window(release_state());
         let f = w.global::<Flow>();
         f.invoke_action("finish:release".into());
-        apply(&w, Event::FlowPlan { request: release_request(), plan: FinishPlan { steps: release_steps(), blocker: None } });
+        apply(&w, Event::FlowPlan { request: release_request(), plan: FinishPlan { steps: release_steps(), blocker: None, tips: Vec::new() } });
         apply(&w, Event::FlowPushing);
         log.borrow_mut().clear();
         press(&w, Key::Escape.into(), false);
@@ -3739,7 +3828,11 @@ mod tests {
         press(&w, Key::Return.into(), false);
         assert!(log.borrow().is_empty(), "{:?}", log.borrow());
 
-        let plan = FinishPlan { steps: vec![step("Merge feature/other into develop", "1 commit", false)], blocker: None };
+        let plan = FinishPlan {
+            steps: vec![step("Merge feature/other into develop", "1 commit", false)],
+            blocker: None,
+            tips: Vec::new(),
+        };
         apply(&w, Event::FlowPlan { request: feature_request("feature/other"), plan });
         f.invoke_submit_finish();
         assert!(matches!(log.borrow().as_slice(), [Command::FlowFinish(r)] if *r == feature_request("feature/other")));
@@ -3771,7 +3864,11 @@ mod tests {
         let (w, log) = flow_window(release_state());
         let f = w.global::<Flow>();
         f.invoke_action("finish:release".into());
-        let blocked = FinishPlan { steps: release_steps(), blocker: Some(Blocker::TagExists("v1.2.0".into())) };
+        let blocked = FinishPlan {
+            steps: release_steps(),
+            blocker: Some(Blocker::TagExists("v1.2.0".into())),
+            tips: Vec::new(),
+        };
         apply(&w, Event::FlowPlan { request: release_request(), plan: blocked });
         type_text(&w, "1");
         assert_eq!((f.get_blocker_level(), f.get_blocker_title().as_str()), (-1, "Tag v1.2.0 already exists"));

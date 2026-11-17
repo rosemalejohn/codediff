@@ -183,6 +183,7 @@ Start and Initialize show no notice; the branch button changing is the feedback.
 
 The checks run when the finish dialog opens, when its branch picker changes, and again when Finish is clicked. All are read-only apart from writing unreferenced Git objects. Any failure blocks the finish and is explained in the dialog:
 
+0. **Branches moved** (Finish clicked only): the finish is pinned to the branch tips of the plan the owner saw (the finished branch, develop, and production for release and hotfix). If any of them has changed since, nothing runs: "feature/x changed since you looked. Review the new commits, then finish again." The dialog then shows the fresh plan. The finish reads each tip once and builds every commit, reference move and push from that one snapshot. While the dialog is open, a change to the Git Flow state plans again. (Controller ruling after the branch review: the agent may commit at any moment.)
 1. **Uncommitted changes:** staged or unstaged changes to tracked files block the finish ("13 uncommitted changes. Finish needs a clean working tree."). Untracked files do not, as in git-flow.
 2. **Repository busy:** a merge, rebase or cherry-pick in progress blocks it.
 3. **Identity:** `user.name` and `user.email` must be set (merge commits and tags need them).
@@ -214,7 +215,7 @@ Recommended technique (Claude's call, the builder may choose another that keeps 
 2. Check out the final tree (develop's new tip) with a safe checkout while HEAD still points at the old commit, so the library compares the working tree against the right baseline.
 3. Only then move references: production, tag, develop, HEAD, and delete the finished branch.
 
-Step 3 is a handful of reference writes. If one of them fails, the error banner names the step that failed and the steps that already ran.
+Step 3 is a handful of reference writes. If one of them fails, the error banner names the step that failed and the steps that already ran, and says that the working tree already shows develop's new content. The finished branch is deleted only while it still points at the commit that was merged; otherwise it is kept and the finish stops there.
 
 ### 8.7 Push
 
