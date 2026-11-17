@@ -1,6 +1,7 @@
 //! Maps controller Events onto `AppWindow` properties and UI callbacks onto Commands.
 use crate::branch::{BranchInfo, HeadInfo};
 use crate::controller::{Command, DiffView, Event, RangeInfo, Selection};
+use crate::flow::{next_actions, FlowKind, FlowState};
 use crate::history::relative_time;
 use crate::highlight::{StyledCell, StyledRow};
 use crate::sbs::{ExpandDir, GapCtl};
@@ -9,7 +10,7 @@ use crate::model::{
 };
 use crate::settings::{Appearance, Settings};
 use crate::switcher::{project_name, rank, rank_names};
-use crate::ui::{AppWindow, CellData, CommitRow, FileRow, RowData, SegData, SwitcherItem};
+use crate::ui::{AppWindow, CellData, CommitRow, FileRow, Flow, FlowStep, RowData, SegData, SwitcherItem};
 use git2::Oid;
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::collections::HashSet;
@@ -48,6 +49,7 @@ const HIST_COMMIT: i32 = 1;
 const HIST_RANGE: i32 = 2;
 
 const SWITCHER_BRANCHES: i32 = 1;
+const SWITCHER_FLOW: i32 = 2;
 
 /// Width of `cols` monospace columns of diff text plus its end padding.
 fn text_width(cols: usize) -> f32 {
@@ -97,6 +99,7 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
             set_history_selection(window, HIST_NONE, "", "", "");
             window.set_range_banner(SharedString::new());
             clear_commit_files(window);
+            reset_flow(window);
         }
         Event::Status(lists) => {
             let side = window.get_selected_side();
@@ -176,9 +179,10 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
             if window.get_history_mode() != HIST_RANGE {
                 window.set_range_banner(SharedString::new());
             }
-        }        // Git Flow events are wired to the window by the UI tasks.
-        Event::Flow(_)
-        | Event::FlowStartCheck { .. }
+        }
+        Event::Flow(state) => apply_flow(window, &state, now),
+        // The flow dialogs (Tasks 9 and 10) map these.
+        Event::FlowStartCheck { .. }
         | Event::FlowPlan { .. }
         | Event::FlowPushing
         | Event::FlowPushFailed(_)
@@ -642,6 +646,149 @@ fn branch_item(b: &BranchInfo, now: i64) -> SwitcherItem {
     SwitcherItem { name: b.name.as_str().into(), detail: detail.into(), key: b.refname.as_str().into(), current: b.current }
 }
 
+// ---- git flow ----
+
+const FLOW_NO_KIND: i32 = -1;
+const FLOW_DIALOG_NONE: i32 = 0;
+const FLOW_DIALOG_INIT: i32 = 1;
+const FLOW_DIALOG_START: i32 = 2;
+const FLOW_DIALOG_FINISH: i32 = 3;
+
+fn flow_kind_index(kind: FlowKind) -> i32 {
+    match kind {
+        FlowKind::Feature => 0,
+        FlowKind::Release => 1,
+        FlowKind::Hotfix => 2,
+    }
+}
+
+fn flow_kind_from_key(word: &str) -> Option<FlowKind> {
+    match word {
+        "feature" => Some(FlowKind::Feature),
+        "release" => Some(FlowKind::Release),
+        "hotfix" => Some(FlowKind::Hotfix),
+        _ => None,
+    }
+}
+
+fn string_model(items: &[String]) -> ModelRc<SharedString> {
+    let items: Vec<SharedString> = items.iter().map(|s| s.as_str().into()).collect();
+    ModelRc::new(VecModel::from(items))
+}
+
+/// Fills the repository-state half of the `Flow` global from `Event::Flow`.
+fn apply_flow(window: &AppWindow, state: &FlowState, now: i64) {
+    let f = window.global::<Flow>();
+    let names = state.config.as_ref().unwrap_or(&state.draft);
+    f.set_initialized(state.config.is_some());
+    f.set_init_blocked(state.init_blocked.as_deref().unwrap_or_default().into());
+    f.set_branches(string_model(&state.branches));
+    f.set_production(names.production.as_str().into());
+    f.set_develop(names.develop.as_str().into());
+    f.set_feature_prefix(names.feature.as_str().into());
+    f.set_release_prefix(names.release.as_str().into());
+    f.set_hotfix_prefix(names.hotfix.as_str().into());
+    f.set_tag_prefix(names.version_tag.as_str().into());
+    f.set_features(string_model(&state.features));
+    f.set_release(state.releases.first().map(String::as_str).unwrap_or_default().into());
+    f.set_hotfix(state.hotfixes.first().map(String::as_str).unwrap_or_default().into());
+    let (kind, branch) = match &state.current {
+        Some((kind, branch)) => (flow_kind_index(*kind), branch.as_str()),
+        None => (FLOW_NO_KIND, ""),
+    };
+    f.set_current_kind(kind);
+    f.set_current_branch(branch.into());
+    let tag = match &state.latest_tag {
+        Some(t) => format!("Latest tag: {}, {}", t.name, relative_time(now, t.time)),
+        None => "No tags yet".to_string(),
+    };
+    f.set_latest_tag(tag.into());
+    f.set_push_blocked(state.push_blocked.as_deref().unwrap_or_default().into());
+    f.set_push_default(state.push_default);
+    let actions: Vec<SwitcherItem> = next_actions(state)
+        .into_iter()
+        .map(|a| SwitcherItem { name: a.name.into(), detail: a.detail.into(), key: a.key.into(), current: false })
+        .collect();
+    f.set_actions(ModelRc::new(VecModel::from(actions)));
+    if window.get_switcher_open() && window.get_switcher_mode() == SWITCHER_FLOW {
+        filter_flow_actions(window, &window.get_switcher_query());
+    }
+}
+
+/// Puts every `Flow` property back to its default (another repository opened).
+fn reset_flow(window: &AppWindow) {
+    let f = window.global::<Flow>();
+    let empty = SharedString::new;
+    f.set_initialized(false);
+    f.set_init_blocked(empty());
+    f.set_branches(string_model(&[]));
+    f.set_production(empty());
+    f.set_develop(empty());
+    f.set_feature_prefix(empty());
+    f.set_release_prefix(empty());
+    f.set_hotfix_prefix(empty());
+    f.set_tag_prefix(empty());
+    f.set_features(string_model(&[]));
+    f.set_release(empty());
+    f.set_hotfix(empty());
+    f.set_current_kind(FLOW_NO_KIND);
+    f.set_current_branch(empty());
+    f.set_latest_tag(empty());
+    f.set_push_blocked(empty());
+    f.set_push_default(false);
+    f.set_actions(ModelRc::new(VecModel::<SwitcherItem>::default()));
+    f.set_dialog(FLOW_DIALOG_NONE);
+    f.set_kind(0);
+    f.set_error(empty());
+    f.set_notice(empty());
+    f.set_init_production(empty());
+    f.set_init_develop(empty());
+    f.set_init_develop_new(false);
+    f.set_init_feature(empty());
+    f.set_init_release(empty());
+    f.set_init_hotfix(empty());
+    f.set_init_tag(empty());
+    f.set_name(empty());
+    f.set_start_error(empty());
+    f.set_branch(empty());
+    f.set_branch_options(string_model(&[]));
+    f.set_tag(empty());
+    f.set_message(empty());
+    f.set_delete_branch(true);
+    f.set_push(false);
+    f.set_steps(ModelRc::new(VecModel::<FlowStep>::default()));
+    f.set_blocker_level(0);
+    f.set_blocker_title(empty());
+    f.set_blocker_body(empty());
+    f.set_blocker_files(string_model(&[]));
+    f.set_push_reason(empty());
+}
+
+/// Fills the Next Action list with the flow actions matching `query`.
+fn filter_flow_actions(window: &AppWindow, query: &str) {
+    let all: Vec<SwitcherItem> = window.global::<Flow>().get_actions().iter().collect();
+    let names: Vec<String> = all.iter().map(|a| a.name.to_string()).collect();
+    let items = rank_names(query, &names).into_iter().map(|i| all[i].clone()).collect();
+    show_items(window, query, items);
+}
+
+/// Opens the dialog for an action key (`init`, `start:<kind>`,
+/// `finish:<kind>[:<branch>]`). The dialogs fill their own fields.
+fn flow_action(window: &AppWindow, key: &str) {
+    let f = window.global::<Flow>();
+    let mut parts = key.splitn(3, ':');
+    let (dialog, kind) = match (parts.next(), parts.next().and_then(flow_kind_from_key)) {
+        (Some("init"), _) => (FLOW_DIALOG_INIT, None),
+        (Some("start"), Some(kind)) => (FLOW_DIALOG_START, Some(kind)),
+        (Some("finish"), Some(kind)) => (FLOW_DIALOG_FINISH, Some(kind)),
+        _ => return,
+    };
+    if let Some(kind) = kind {
+        f.set_kind(flow_kind_index(kind));
+    }
+    f.set_dialog(dialog);
+}
+
 /// Applies a saved appearance choice (System follows macOS).
 pub fn set_appearance(window: &AppWindow, appearance: Appearance) {
     window.set_appearance(appearance.index());
@@ -683,7 +830,9 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
     let weak = window.as_weak();
     window.on_switcher_filter(move |query| {
         if let Some(w) = weak.upgrade() {
-            if w.get_switcher_mode() == SWITCHER_BRANCHES {
+            if w.get_switcher_mode() == SWITCHER_FLOW {
+                filter_flow_actions(&w, &query);
+            } else if w.get_switcher_mode() == SWITCHER_BRANCHES {
                 filter_branches(&w, &query);
             } else {
                 filter_projects(&w, &query);
@@ -693,6 +842,13 @@ pub fn wire(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
 
     let s = send.clone();
     window.on_list_branches(move || s(Command::ListBranches));
+
+    let weak = window.as_weak();
+    window.global::<Flow>().on_action(move |key| {
+        if let Some(w) = weak.upgrade() {
+            flow_action(&w, &key);
+        }
+    });
 
     let s = send.clone();
     window.on_checkout_branch(move |refname| s(Command::Checkout(refname.into())));
@@ -2367,5 +2523,188 @@ mod tests {
         assert!(log.borrow().iter().any(|c| matches!(c, Command::StageFile(p) if p == "a.rs")));
         press(&w, Key::Backspace.into(), true);
         assert_eq!(w.get_discard_kind(), 1);
+    }
+
+    // ---- git flow ----
+
+    use crate::flow::{FlowConfig, FlowKind, FlowState, TagInfo};
+    use crate::ui::Flow;
+
+    /// Presses and releases `text` with Option and Command (Slint's `alt` and
+    /// `control`) held.
+    fn press_opt_cmd(w: &AppWindow, text: SharedString) {
+        let win = w.window();
+        win.dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        win.dispatch_event(WindowEvent::KeyPressed { text: Key::Alt.into() });
+        win.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        win.dispatch_event(WindowEvent::KeyReleased { text });
+        win.dispatch_event(WindowEvent::KeyReleased { text: Key::Alt.into() });
+        win.dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+    }
+
+    fn flow_config() -> FlowConfig {
+        FlowConfig {
+            production: "main".into(),
+            develop: "develop".into(),
+            feature: "feature/".into(),
+            release: "release/".into(),
+            hotfix: "hotfix/".into(),
+            version_tag: String::new(),
+        }
+    }
+
+    /// Initialized, production `main`, on `feature/login-form`, nothing else open.
+    fn flow_state() -> FlowState {
+        FlowState {
+            config: Some(flow_config()),
+            draft: flow_config(),
+            init_blocked: None,
+            branches: vec!["develop".into(), "feature/login-form".into(), "main".into()],
+            features: vec!["feature/login-form".into()],
+            releases: vec![],
+            hotfixes: vec![],
+            current: Some((FlowKind::Feature, "feature/login-form".into())),
+            latest_tag: None,
+            push_blocked: None,
+            push_default: false,
+        }
+    }
+
+    /// A shown, wired window with a repo open and `state` applied.
+    fn flow_window(state: FlowState) -> (AppWindow, Rc<RefCell<Vec<Command>>>) {
+        let w = window();
+        let (log, send) = recorder();
+        wire(&w, send);
+        w.show().unwrap();
+        opened(&w, "/w/proj", &["/w/proj"]);
+        apply(&w, Event::Flow(state));
+        log.borrow_mut().clear();
+        (w, log)
+    }
+
+    #[test]
+    fn flow_event_fills_global() {
+        let w = window();
+        apply(&w, Event::Flow(flow_state()));
+        let f = w.global::<Flow>();
+        assert!(f.get_initialized());
+        assert_eq!(
+            (f.get_production().as_str(), f.get_develop().as_str(), f.get_feature_prefix().as_str()),
+            ("main", "develop", "feature/")
+        );
+        assert_eq!((f.get_current_kind(), f.get_current_branch().as_str()), (0, "feature/login-form"));
+        assert_eq!(f.get_latest_tag(), "No tags yet");
+        assert_eq!((f.get_release().as_str(), f.get_hotfix().as_str()), ("", ""));
+        assert_eq!(f.get_features().row_count(), 1);
+        assert_eq!(f.get_actions().row_count(), 4);
+        assert!(f.get_actions().iter().all(|a| !a.current));
+    }
+
+    #[test]
+    fn latest_tag_text_has_name_and_age() {
+        let w = window();
+        let mut state = flow_state();
+        state.latest_tag = Some(TagInfo { name: "1.1.0".into(), time: NOW - 2 * 86400 });
+        apply_at(&w, Event::Flow(state), NOW);
+        assert_eq!(w.global::<Flow>().get_latest_tag(), "Latest tag: 1.1.0, 2d ago");
+    }
+
+    #[test]
+    fn opt_cmd_f_opens_next_action_with_finish_first() {
+        let (w, _log) = flow_window(flow_state());
+        press_opt_cmd(&w, "f".into());
+        assert!(w.get_switcher_open());
+        assert_eq!(w.get_switcher_mode(), SWITCHER_FLOW);
+        assert_eq!(w.get_switcher_items().row_data(0).unwrap().key, "finish:feature:feature/login-form");
+        assert_eq!(w.get_switcher_index(), 0);
+    }
+
+    #[test]
+    fn opt_cmd_f_accepts_option_character() {
+        let (w, _log) = flow_window(flow_state());
+        press_opt_cmd(&w, "\u{192}".into());
+        assert!(w.get_switcher_open());
+        assert_eq!(w.get_switcher_mode(), SWITCHER_FLOW);
+    }
+
+    #[test]
+    fn opt_cmd_f_ignored_while_a_flow_dialog_shows() {
+        let (w, _log) = flow_window(flow_state());
+        w.global::<Flow>().set_dialog(2);
+        press_opt_cmd(&w, "f".into());
+        assert!(!w.get_switcher_open());
+    }
+
+    #[test]
+    fn next_action_filter_narrows_rows() {
+        let (w, _log) = flow_window(flow_state());
+        press_opt_cmd(&w, "f".into());
+        w.invoke_switcher_filter("hot".into());
+        assert_eq!(w.get_switcher_items().row_count(), 1);
+        assert_eq!(w.get_switcher_items().row_data(0).unwrap().key, "start:hotfix");
+    }
+
+    #[test]
+    fn return_on_next_action_row_opens_its_dialog() {
+        let (w, log) = flow_window(flow_state());
+        press_opt_cmd(&w, "f".into());
+        press(&w, Key::Return.into(), false);
+        assert!(!w.get_switcher_open());
+        let f = w.global::<Flow>();
+        assert_eq!((f.get_dialog(), f.get_kind()), (3, 0));
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn uninitialized_offers_only_init() {
+        let mut state = flow_state();
+        state.config = None;
+        state.current = None;
+        let (w, _log) = flow_window(state);
+        assert!(!w.global::<Flow>().get_initialized());
+        press_opt_cmd(&w, "f".into());
+        let items = w.get_switcher_items();
+        assert_eq!(items.row_count(), 1);
+        assert_eq!(items.row_data(0).unwrap().key, "init");
+    }
+
+    #[test]
+    fn uninitialized_shows_draft_names() {
+        let mut state = flow_state();
+        state.config = None;
+        state.draft.production = "master".into();
+        state.draft.hotfix = "fix/".into();
+        let w = window();
+        apply(&w, Event::Flow(state));
+        let f = w.global::<Flow>();
+        assert_eq!((f.get_production().as_str(), f.get_hotfix_prefix().as_str()), ("master", "fix/"));
+    }
+
+    #[test]
+    fn action_opens_dialog_and_sends_nothing() {
+        let (w, log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("start:release".into());
+        assert_eq!((f.get_dialog(), f.get_kind()), (2, 1));
+        f.invoke_action("finish:hotfix:hotfix/1.2.1".into());
+        assert_eq!((f.get_dialog(), f.get_kind()), (3, 2));
+        f.invoke_action("init".into());
+        assert_eq!(f.get_dialog(), 1);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn repo_opened_resets_flow() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.set_dialog(3);
+        f.set_notice("Finished feature/login-form".into());
+        opened(&w, "/w/other", &["/w/other"]);
+        assert!(!f.get_initialized());
+        assert_eq!(f.get_dialog(), 0);
+        assert_eq!(f.get_notice(), "");
+        assert_eq!(f.get_current_kind(), -1);
+        assert!(f.get_delete_branch());
+        assert_eq!(f.get_actions().row_count(), 0);
     }
 }

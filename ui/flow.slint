@@ -1,0 +1,257 @@
+// Git Flow: the shared state global and the top bar menu.
+import { Theme, Kbd } from "theme.slint";
+import { SwitcherItem } from "switcher.slint";
+
+// One line of a finish plan. state: 0 pending, 1 done, 2 running, 3 failed.
+export struct FlowStep {
+    text: string,
+    note: string,
+    remote: bool,
+    state: int,
+}
+
+// Flow state of the open repository and of the flow dialogs, filled by the
+// bridge. Kinds are 0 feature, 1 release, 2 hotfix.
+export global Flow {
+    // Repository state, from Event::Flow.
+    in-out property <bool> initialized;
+    in-out property <string> init-blocked;
+    in-out property <[string]> branches;
+    in-out property <string> production;
+    in-out property <string> develop;
+    in-out property <string> feature-prefix;
+    in-out property <string> release-prefix;
+    in-out property <string> hotfix-prefix;
+    in-out property <string> tag-prefix;
+    in-out property <[string]> features;
+    // Open release branch, or "".
+    in-out property <string> release;
+    in-out property <string> hotfix;
+    // -1 none, otherwise the kind of the checked-out flow branch.
+    in-out property <int> current-kind: -1;
+    in-out property <string> current-branch;
+    // "Latest tag: 1.1.0, 21d ago" or "No tags yet".
+    in-out property <string> latest-tag;
+    in-out property <string> push-blocked;
+    in-out property <bool> push-default;
+    // Next Action rows, unfiltered.
+    in-out property <[SwitcherItem]> actions;
+
+    // Dialog: 0 none, 1 initialize, 2 start, 3 finish, 4 pushing, 5 push failed.
+    in-out property <int> dialog;
+    in-out property <int> kind;
+    // From Event::FlowFailed.
+    in-out property <string> error;
+    // Green banner text.
+    in-out property <string> notice;
+    // Initialize.
+    in-out property <string> init-production;
+    in-out property <string> init-develop;
+    in-out property <bool> init-develop-new;
+    in-out property <string> init-feature;
+    in-out property <string> init-release;
+    in-out property <string> init-hotfix;
+    in-out property <string> init-tag;
+    // Start.
+    in-out property <string> name;
+    in-out property <string> start-error;
+    // Finish.
+    in-out property <string> branch;
+    in-out property <[string]> branch-options;
+    in-out property <string> tag;
+    in-out property <string> message;
+    in-out property <bool> delete-branch: true;
+    in-out property <bool> push;
+    in-out property <[FlowStep]> steps;
+    // 0 none, 1 Finish disabled, 2 only Close.
+    in-out property <int> blocker-level;
+    in-out property <string> blocker-title;
+    in-out property <string> blocker-body;
+    in-out property <[string]> blocker-files;
+    in-out property <string> push-reason;
+
+    // An action key: init, start:<kind>, finish:<kind>[:<branch>].
+    callback action(string);
+    callback cancel();
+    callback init-develop-edited(string);
+    callback submit-init();
+    callback name-edited(string);
+    callback submit-start();
+    callback plan-changed();
+    callback submit-finish();
+    callback retry-push();
+    callback close-push-failed();
+    callback dismiss-notice();
+}
+
+// One row of the Git Flow menu: label, then a hint or a shortcut on the right.
+component FlowMenuItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <string> hint;
+    in property <bool> shortcut: false;
+    callback clicked();
+
+    property <bool> hot: root.enabled && touch.has-hover;
+
+    height: 30px;
+    border-radius: Theme.radius-sm + 1px;
+    background: root.hot ? Theme.row-selected : transparent;
+
+    layout := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 16px;
+
+        Text {
+            text: root.text;
+            color: !root.enabled ? Theme.text-faint : root.hot ? Theme.row-selected-text : Theme.text;
+            font-size: Theme.font-size;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        if root.hint != "": Text {
+            text: root.hint;
+            color: Theme.text-faint;
+            font-size: Theme.small-font-size;
+            vertical-alignment: center;
+        }
+
+        if root.shortcut: HorizontalLayout {
+            spacing: 3px;
+
+            Kbd {
+                y: (parent.height - self.height) / 2;
+                text: "\u{2325}";
+            }
+
+            Kbd {
+                y: (parent.height - self.height) / 2;
+                text: "\u{2318}";
+            }
+
+            Kbd {
+                y: (parent.height - self.height) / 2;
+                text: "F";
+            }
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component FlowMenuSeparator inherits Rectangle {
+    height: 9px;
+
+    Rectangle {
+        height: 1px;
+        background: Theme.border;
+    }
+}
+
+// Body of the Git Flow popup. `action(key)` carries a Flow action key;
+// `next-action()` asks for the Next Action search panel.
+export component FlowMenu inherits Rectangle {
+    callback action(string);
+    callback next-action();
+
+    property <bool> ready: Flow.initialized;
+
+    preferred-width: max(252px, layout.preferred-width);
+    background: Theme.popup-bg;
+    border-color: Theme.border;
+    border-width: 1px;
+    border-radius: Theme.radius-lg - 2px;
+    drop-shadow-blur: 18px;
+    drop-shadow-offset-y: 4px;
+    drop-shadow-color: Theme.shadow;
+
+    layout := VerticalLayout {
+        padding: 5px;
+        spacing: 0px;
+
+        FlowMenuItem {
+            text: "Initialize Repository\u{2026}";
+            enabled: !root.ready && Flow.init-blocked == "";
+            hint: root.ready ? "" : Flow.init-blocked;
+            clicked => {
+                root.action("init");
+            }
+        }
+
+        FlowMenuItem {
+            text: "Next Action\u{2026}";
+            enabled: root.ready;
+            shortcut: true;
+            clicked => {
+                root.next-action();
+            }
+        }
+
+        FlowMenuSeparator { }
+
+        FlowMenuItem {
+            text: "Start New Feature\u{2026}";
+            enabled: root.ready;
+            clicked => {
+                root.action("start:feature");
+            }
+        }
+
+        FlowMenuItem {
+            text: "Finish Feature\u{2026}";
+            enabled: root.ready && Flow.features.length > 0;
+            hint: root.ready && Flow.features.length == 0 ? "none open" : "";
+            clicked => {
+                root.action("finish:feature");
+            }
+        }
+
+        FlowMenuSeparator { }
+
+        FlowMenuItem {
+            text: "Start New Release\u{2026}";
+            enabled: root.ready && Flow.release == "";
+            hint: root.ready && Flow.release != "" ? "one open" : "";
+            clicked => {
+                root.action("start:release");
+            }
+        }
+
+        FlowMenuItem {
+            text: "Finish Release\u{2026}";
+            enabled: root.ready && Flow.release != "";
+            hint: root.ready && Flow.release == "" ? "none open" : "";
+            clicked => {
+                root.action("finish:release:" + Flow.release);
+            }
+        }
+
+        FlowMenuSeparator { }
+
+        FlowMenuItem {
+            text: "Start New Hotfix\u{2026}";
+            enabled: root.ready && Flow.hotfix == "";
+            hint: root.ready && Flow.hotfix != "" ? "one open" : "";
+            clicked => {
+                root.action("start:hotfix");
+            }
+        }
+
+        FlowMenuItem {
+            text: "Finish Hotfix\u{2026}";
+            enabled: root.ready && Flow.hotfix != "";
+            hint: root.ready && Flow.hotfix == "" ? "none open" : "";
+            clicked => {
+                root.action("finish:hotfix:" + Flow.hotfix);
+            }
+        }
+    }
+}
