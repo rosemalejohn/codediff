@@ -486,3 +486,21 @@ fn start_refuses_names_nested_with_an_existing_branch() {
         assert!(s.staged.is_empty() && s.unstaged.is_empty(), "{s:?}");
     }
 }
+
+/// Version-like names do not form a total order (`1.1a` < `1.9` < `1.10` <
+/// `1.1a`), so they must never drive a sort: the lookup has to survive many
+/// such tags on one commit.
+#[test]
+fn latest_tag_survives_names_that_do_not_order() {
+    let (t, cfg) = timed_flow_repo("");
+    // 36 names on one commit; this exact set made a comparison sort panic.
+    for i in 0..12 {
+        for last in ["1a", "9", "10"] {
+            tag(&t, &format!("1.{i}.{last}"), "HEAD");
+        }
+    }
+    init(&t.repo, &cfg).unwrap();
+    let found = latest_tag(&t.repo, &cfg).unwrap().unwrap();
+    assert_eq!(found.time, 2000);
+    assert!(found.name.starts_with("1."), "{}", found.name);
+}

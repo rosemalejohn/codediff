@@ -394,11 +394,22 @@ pub fn latest_tag(repo: &Repository, cfg: &FlowConfig) -> Result<Option<TagInfo>
         };
         candidates.push((TagInfo { name: name.to_string(), time: commit.time().seconds() }, commit.id()));
     }
-    // Stable, so exact ties keep the name order of `tag_names`, as before.
-    candidates.sort_by(|(a, _), (b, _)| b.time.cmp(&a.time).then_with(|| compare_versions(&b.name, &a.name)));
-    for (info, id) in candidates {
-        if id == tip || repo.graph_descendant_of(tip, id)? {
-            return Ok(Some(info));
+    // Newest first by time only: `compare_versions` is not a total order
+    // (`1.1a` < `1.9` < `1.10` < `1.1a`), and a sort panics on such a
+    // comparator. It only picks among the reachable tags of one commit time.
+    candidates.sort_by_key(|(info, _)| std::cmp::Reverse(info.time));
+    for same_time in candidates.chunk_by(|(a, _), (b, _)| a.time == b.time) {
+        let mut best: Option<&TagInfo> = None;
+        for (info, id) in same_time {
+            if *id != tip && !repo.graph_descendant_of(tip, *id)? {
+                continue;
+            }
+            if best.is_none_or(|b| compare_versions(&info.name, &b.name) == Ordering::Greater) {
+                best = Some(info);
+            }
+        }
+        if let Some(info) = best {
+            return Ok(Some(info.clone()));
         }
     }
     Ok(None)
