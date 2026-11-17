@@ -934,11 +934,10 @@ fn flow_drop_push_reports_not_pushed() {
     h.wait_for(m2, |e| matches!(e, Event::FlowDone(n) if n == "Finished release/1.2.0. Tagged 1.2.0. Not pushed."));
     assert!(origin_ref(&bare, "refs/tags/1.2.0").is_none());
 
-    // The pending push is gone: a retry does nothing.
+    // The pending push is gone: a retry pushes nothing and only answers.
     let m3 = h.mark();
     h.ctl.send(Command::FlowRetryPush);
-    h.ctl.send(Command::ListBranches);
-    h.wait_for(m3, |e| matches!(e, Event::Branches(_)));
+    h.wait_for(m3, |e| matches!(e, Event::FlowDone(n) if n.is_empty()));
     assert!(!h.events.lock().unwrap()[m3..].iter().any(|e| matches!(e, Event::FlowPushing)));
 }
 
@@ -949,4 +948,31 @@ fn branch_created_outside_updates_flow_state() {
     let m = h.open(t.path());
     t.branch("feature/outside");
     h.wait_for(m, |e| matches!(e, Event::Flow(s) if s.features.contains(&"feature/outside".to_string())));
+}
+
+#[test]
+fn second_finish_keeps_the_pending_push() {
+    let (t, cfg, bare) = release_repo();
+    advance_origin_production(&bare, &cfg);
+    let h = Harness::new();
+    let m = h.open(t.path());
+    // A double-submitted Finish: the second one fails, the push stays pending.
+    h.ctl.send(Command::FlowFinish(push_release_req()));
+    h.ctl.send(Command::FlowFinish(push_release_req()));
+    let (i, _) = h.wait_within(PUSH_TIMEOUT, m, |e| matches!(e, Event::FlowPushFailed(_)));
+    let (j, _) = h.wait_for(i, |e| matches!(e, Event::FlowFailed(_)));
+    h.ctl.send(Command::FlowDropPush);
+    h.wait_for(j, |e| matches!(e, Event::FlowDone(n) if n == "Finished release/1.2.0. Tagged 1.2.0. Not pushed."));
+}
+
+#[test]
+fn push_commands_with_nothing_pending_still_answer() {
+    let (t, _) = common::flow_repo();
+    let h = Harness::new();
+    let m = h.open(t.path());
+    h.ctl.send(Command::FlowDropPush);
+    let (i, _) = h.wait_for(m, |e| matches!(e, Event::FlowDone(n) if n.is_empty()));
+    h.ctl.send(Command::FlowRetryPush);
+    h.wait_for(i + 1, |e| matches!(e, Event::FlowDone(n) if n.is_empty()));
+    assert!(!h.events.lock().unwrap()[m..].iter().any(|e| matches!(e, Event::FlowPushing)));
 }

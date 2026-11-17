@@ -816,10 +816,8 @@ impl Worker {
     }
 
     fn flow_finish(&mut self, req: FinishRequest) {
-        // A new finish replaces any pending push.
-        if let Some(o) = &mut self.open {
-            o.pending_push = None;
-        }
+        // A pending push survives a finish that fails; one that succeeds
+        // replaces it below.
         let Some((repo, cfg)) = self.flow_config() else { return };
         let outcome = match flow_finish::finish(repo, &cfg, &req) {
             Ok(o) => o,
@@ -849,10 +847,11 @@ impl Worker {
         self.open.as_ref().is_some_and(|o| o.pending_push.is_some())
     }
 
-    /// Runs the pending push on this thread. Success forgets it; failure keeps it.
+    /// Runs the pending push on this thread. Success forgets it; failure keeps
+    /// it. With nothing pending it answers `FlowDone("")`, so the dialog closes.
     fn flow_push(&mut self) {
         let Some(o) = &self.open else { return };
-        let Some(p) = &o.pending_push else { return };
+        let Some(p) = &o.pending_push else { return self.emit(Event::FlowDone(String::new())) };
         self.emit(Event::FlowPushing);
         let result = match (&self.git, o.repo.workdir()) {
             (Some(Some(git)), Some(workdir)) => push::push(git, workdir, &p.spec),
@@ -869,9 +868,7 @@ impl Worker {
     }
 
     fn flow_drop_push(&mut self) {
-        let Some(o) = &mut self.open else { return };
-        if let Some(p) = o.pending_push.take() {
-            self.emit(Event::FlowDone(p.notice));
-        }
+        let notice = self.open.as_mut().and_then(|o| o.pending_push.take()).map(|p| p.notice);
+        self.emit(Event::FlowDone(notice.unwrap_or_default()));
     }
 }

@@ -1072,7 +1072,9 @@ fn wire_flow(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         s(Command::FlowPlan(finish_request(&w)));
     });
 
-    // Only with a plan on screen and nothing blocking it.
+    // Only with a plan on screen and nothing blocking it. Once sent, Finish
+    // waits for the worker's answer: a failure brings a fresh plan, success
+    // closes the dialog or moves it on to the push.
     let s = send.clone();
     let weak = window.as_weak();
     f.on_submit_finish(move || {
@@ -1080,6 +1082,7 @@ fn wire_flow(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
         let f = w.global::<Flow>();
         if f.get_dialog() == FLOW_DIALOG_FINISH && f.get_blocker_level() == BLOCKER_NONE && f.get_steps().row_count() > 0
         {
+            f.set_blocker_level(BLOCKER_PENDING);
             s(Command::FlowFinish(finish_request(&w)));
         }
     });
@@ -3551,6 +3554,24 @@ mod tests {
         apply(&w, Event::FlowPlan { request: req.clone(), plan: FinishPlan { steps: release_steps(), blocker: None } });
         f.invoke_submit_finish();
         assert!(matches!(log.borrow().last(), Some(Command::FlowFinish(r)) if *r == req));
+    }
+
+    #[test]
+    fn second_submit_finish_sends_nothing() {
+        let (w, log) = finish_feature_window(None);
+        let f = w.global::<Flow>();
+        f.invoke_submit_finish();
+        f.invoke_submit_finish();
+        press(&w, Key::Return.into(), false);
+        assert_eq!(log.borrow().len(), 1, "{:?}", log.borrow());
+        assert!(matches!(log.borrow().as_slice(), [Command::FlowFinish(_)]));
+        // A failed finish is followed by a fresh plan, which allows Finish again.
+        apply(&w, Event::FlowFailed("boom".into()));
+        f.invoke_submit_finish();
+        assert_eq!(log.borrow().len(), 1, "{:?}", log.borrow());
+        apply(&w, Event::FlowPlan { request: feature_request("feature/login-form"), plan: feature_plan(None) });
+        f.invoke_submit_finish();
+        assert_eq!(log.borrow().len(), 2, "{:?}", log.borrow());
     }
 
     #[test]
