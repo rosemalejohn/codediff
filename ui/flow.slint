@@ -63,7 +63,7 @@ export global Flow {
     in-out property <bool> delete-branch: true;
     in-out property <bool> push;
     in-out property <[FlowStep]> steps;
-    // 0 none, 1 Finish disabled, 2 only Close.
+    // -1 plan requested, not arrived; 0 none, 1 Finish disabled, 2 only Close.
     in-out property <int> blocker-level;
     in-out property <string> blocker-title;
     in-out property <string> blocker-body;
@@ -1144,7 +1144,9 @@ export component FlowDialog inherits Rectangle {
 
                     // ---- finish (3) ----
 
-                    if Flow.dialog == 3 && Flow.blocker-level != 0: FlowAlert {
+                    // Kept while a new plan is pending (level -1), so the
+                    // dialog does not jump on every keystroke.
+                    if Flow.dialog == 3 && Flow.blocker-title != "": FlowAlert {
                         error: root.close-only;
                         title: Flow.blocker-title;
                         body: Flow.blocker-body;

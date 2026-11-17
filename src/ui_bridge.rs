@@ -196,6 +196,11 @@ fn apply_at(window: &AppWindow, ev: Event, now: i64) {
         Event::FlowDone(text) => {
             let f = window.global::<Flow>();
             f.set_dialog(FLOW_DIALOG_NONE);
+            // The newest of notice and error shows. Start and Initialize
+            // finish with no text and leave an error from around them.
+            if !text.is_empty() {
+                window.set_error_text(SharedString::new());
+            }
             f.set_notice(text.into());
         }
         Event::FlowFailed(text) => window.global::<Flow>().set_error(text.into()),
@@ -678,7 +683,9 @@ const FLOW_DIALOG_START: i32 = 2;
 const FLOW_DIALOG_FINISH: i32 = 3;
 const FLOW_DIALOG_PUSHING: i32 = 4;
 const FLOW_DIALOG_PUSH_FAILED: i32 = 5;
-// Flow.blocker-level: Finish disabled, or only Close.
+// Flow.blocker-level: a plan was asked for and has not arrived, none,
+// Finish disabled, or only Close.
+const BLOCKER_PENDING: i32 = -1;
 const BLOCKER_NONE: i32 = 0;
 const BLOCKER_WARN: i32 = 1;
 const BLOCKER_CLOSE: i32 = 2;
@@ -1056,7 +1063,12 @@ fn wire_flow(window: &AppWindow, send: impl Fn(Command) + Clone + 'static) {
             f.set_tag(tag.into());
             f.set_message(message.into());
             *planned.borrow_mut() = branch;
+            // The old steps name the old branch.
+            clear_finish_plan(&w);
         }
+        // Finish waits for the plan of this request; the steps and the
+        // blocker text stay up meanwhile so the dialog keeps its height.
+        f.set_blocker_level(BLOCKER_PENDING);
         s(Command::FlowPlan(finish_request(&w)));
     });
 
@@ -3689,6 +3701,89 @@ mod tests {
         opened(&w, "/w/other", &["/w/other"]);
         assert_eq!((f.get_dialog(), f.get_push_reason().as_str()), (0, ""));
         assert_eq!(f.get_steps().row_count(), 0);
+    }
+
+    #[test]
+    fn submit_finish_waits_for_the_plan_after_a_picker_change() {
+        let (w, log) = flow_window(two_features_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:feature".into());
+        apply(&w, Event::FlowPlan { request: feature_request("feature/login-form"), plan: feature_plan(None) });
+        f.set_branch("feature/other".into());
+        f.invoke_plan_changed();
+        // The old steps named the old branch: gone until the new plan.
+        assert_eq!(f.get_steps().row_count(), 0);
+        log.borrow_mut().clear();
+        f.invoke_submit_finish();
+        press(&w, Key::Return.into(), false);
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+
+        let plan = FinishPlan { steps: vec![step("Merge feature/other into develop", "1 commit", false)], blocker: None };
+        apply(&w, Event::FlowPlan { request: feature_request("feature/other"), plan });
+        f.invoke_submit_finish();
+        assert!(matches!(log.borrow().as_slice(), [Command::FlowFinish(r)] if *r == feature_request("feature/other")));
+    }
+
+    #[test]
+    fn submit_finish_waits_for_the_plan_after_a_tick_change() {
+        let (w, log) = finish_feature_window(None);
+        let f = w.global::<Flow>();
+        f.set_delete_branch(false);
+        f.invoke_plan_changed();
+        // Same branch: the steps stay up (no jump) but Finish waits.
+        assert_eq!((f.get_steps().row_count(), f.get_blocker_level()), (3, -1));
+        log.borrow_mut().clear();
+        f.invoke_submit_finish();
+        press(&w, Key::Return.into(), false);
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+
+        let mut req = feature_request("feature/login-form");
+        req.delete_branch = false;
+        apply(&w, Event::FlowPlan { request: req.clone(), plan: feature_plan(None) });
+        assert_eq!(f.get_blocker_level(), 0);
+        f.invoke_submit_finish();
+        assert!(matches!(log.borrow().as_slice(), [Command::FlowFinish(r)] if *r == req));
+    }
+
+    #[test]
+    fn pending_plan_keeps_the_warning_text_and_finish_off() {
+        let (w, log) = flow_window(release_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("finish:release".into());
+        let blocked = FinishPlan { steps: release_steps(), blocker: Some(Blocker::TagExists("v1.2.0".into())) };
+        apply(&w, Event::FlowPlan { request: release_request(), plan: blocked });
+        type_text(&w, "1");
+        assert_eq!((f.get_blocker_level(), f.get_blocker_title().as_str()), (-1, "Tag v1.2.0 already exists"));
+        assert_eq!(f.get_steps().row_count(), 7);
+        log.borrow_mut().clear();
+        f.invoke_submit_finish();
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+    }
+
+    #[test]
+    fn finish_notice_replaces_an_error() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        apply(&w, Event::Error("could not refresh".into()));
+        apply(&w, Event::FlowDone("Finished feature/x. Merged into develop.".into()));
+        assert_eq!(w.get_error_text(), "");
+        assert_eq!(f.get_notice(), "Finished feature/x. Merged into develop.");
+    }
+
+    #[test]
+    fn empty_flow_done_keeps_an_error_in_either_order() {
+        let (w, _log) = flow_window(flow_state());
+        let f = w.global::<Flow>();
+        f.invoke_action("init".into());
+        apply(&w, Event::Error("checkout blocked".into()));
+        apply(&w, Event::FlowDone(String::new()));
+        assert_eq!((f.get_dialog(), w.get_error_text().as_str(), f.get_notice().as_str()), (0, "checkout blocked", ""));
+
+        w.set_error_text("".into());
+        f.invoke_action("init".into());
+        apply(&w, Event::FlowDone(String::new()));
+        apply(&w, Event::Error("checkout blocked".into()));
+        assert_eq!((f.get_dialog(), w.get_error_text().as_str()), (0, "checkout blocked"));
     }
 
     #[test]
